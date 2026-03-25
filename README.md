@@ -15,7 +15,10 @@ Available as both a **web dashboard** (FastAPI) and a **standalone desktop app**
 - **Device Alerts** — Real-time Owlet alerts: low oxygen, high/low HR, critical battery, sock off, sock disconnected, low signal (yellow light)
 - **Color-Coded Ranges** — HR and oxygen values change color based on clinical ranges
 - **Quality Badges** — LIVE, CALIBRATING, WEAK, IDLE, DOCKED status indicators based on band placement state
-- **Stale Data Detection** — Warnings when the base station loses connection
+- **Stale Data Detection** — Warnings when the base station loses connection, with automatic multi-stage recovery
+- **Motion Artifact Detection** — Flags unreliable readings during high baby movement (mvb ≥ 50%)
+- **Wake Detection** — Alerts when sleep state transitions from sleep to awake
+- **Sleep Session Tracking** — Tracks total session time with per-state breakdown (Deep, Light, Awake). Brief awakenings don't reset the session — only docking the sock ends it. On startup, queries Ayla datapoint history to recover in-progress sessions.
 - **Technical Diagnostics** — Battery, WiFi signal, sock placement, sleep state, skin temp, charging status
 - **CSV Logging** — Every reading automatically saved to `owlet_data_log.csv`
 - **Token Auto-Refresh** — Long-running sessions stay connected without re-authentication
@@ -186,6 +189,26 @@ The app monitors sleep state (`ss`) transitions and alerts when the baby wakes u
 - Displays a "👶 Baby woke up!" alert banner
 - Correlates with movement spikes (`mvb` and `mv` increases)
 
+### Sleep Session Tracking
+
+The app tracks sleep sessions with per-state time breakdowns, designed to handle real infant sleep patterns:
+
+| Field | Description |
+|-------|-------------|
+| **Total session** | Wall-clock time from first sleep to dock (includes brief awakenings) |
+| **Total sleep** | Accumulated time in Light + Deep sleep only |
+| 🌙 **Deep** | Time in `ss=15` (Deep Sleep) |
+| 💤 **Light** | Time in `ss=8` (Light Sleep) |
+| 👀 **Awake** | Time in `ss=1` (Awake) *during* the session |
+
+**Session lifecycle:**
+- **Starts** when `ss` first enters 8 (Light) or 15 (Deep)
+- **Continues** through brief awakenings (`ss=1`) — babies naturally cycle between sleep states with short wake periods
+- **Ends only** when the sock is docked (`chg=1` or `chg=2`)
+- **Startup recovery** — if the app starts while a session is in progress, it queries the Ayla `/datapoints.json` API to walk back through REAL_TIME_VITALS history and find the true session start (stopping at any docking event)
+
+All timestamps use the server-side `data_updated_at` field from the Ayla cloud, not the local clock, so the timer is accurate even if the app was restarted mid-session.
+
 ### Monitoring State
 
 | Key | Name | Type | Description |
@@ -253,6 +276,22 @@ Three-tier alarm system from `PREVIEW_*_PRIORITY_ALARM` properties:
 | **HIGH** | 🔴 ⚠ HIGH | Critical oxygen, critical heart rate |
 | **MED** | 🟡 ⚠ MED | Out-of-range vitals, discomfort |
 | **LOW** | 🔵 ⚠ LOW | Low battery, placement issues |
+
+## Stall Recovery System
+
+The Owlet base station requires a periodic `APP_ACTIVE=1` heartbeat via the Ayla cloud API to keep pushing `REAL_TIME_VITALS`. If this heartbeat is missed (due to token expiry, an API hiccup, or a pyowletapi bug where `activate()` calls `self.authenticate()` without `await`), the base station stops updating vitals while continuing to process alerts locally (which is why you still get phone notifications during a stall).
+
+The worker implements a multi-stage automatic recovery:
+
+| Stage | Trigger | Action | Effect |
+|-------|---------|--------|--------|
+| **Proactive** | Every 25s | Explicit `APP_ACTIVE=1` POST with fresh token | Prevents most stalls from occurring |
+| **0 — Normal** | lag < 30s | Standard polling | Green status |
+| **1 — Re-auth** | 5 consecutive stale cycles | Force token refresh + explicit `APP_ACTIVE` | Fixes token expiry stalls (~80% of cases) |
+| **2 — Rebuild** | 15 consecutive stale cycles | Tear down and recreate entire API session | Fixes stuck sessions, routing issues |
+| **Backoff** | During stage 2 | Polling slowed to 5s | Avoids rate-limiting during recovery |
+
+Additionally, all `update_properties()` calls have a 15-second timeout to prevent the worker from hanging on a stuck API connection.
 
 ## Building a Standalone .exe
 

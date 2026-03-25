@@ -20,7 +20,7 @@ from pyowletapi.sock import Sock
 
 from config import UPDATE_INTERVAL, LOG_FILE
 from owlet_service import discover_socks
-from data_processing import process_properties
+from data_processing import process_properties, find_sleep_start, set_sleep_start
 from csv_logger import init_csv_logging, log_data_to_csv
 
 logging.basicConfig(level=logging.INFO)
@@ -142,6 +142,62 @@ class TechCard(ctk.CTkFrame):
         self.value_label.configure(text=str(val) if val is not None else "--")
         if color:
             self.value_label.configure(text_color=color)
+
+
+class SleepPanel(ctk.CTkFrame):
+    """A wider panel for sleep session data, matching the web dashboard layout."""
+
+    def __init__(self, master, **kwargs):
+        super().__init__(master, fg_color=COLORS["card"], corner_radius=12,
+                         border_width=1, border_color=COLORS["border"], **kwargs)
+
+        self._title = ctk.CTkLabel(self, text="SLEEP SESSION",
+                                   font=("Inter", 10, "bold"),
+                                   text_color=COLORS["text_sub"])
+        self._title.pack(anchor="w", padx=10, pady=(8, 0))
+
+        self._state_label = ctk.CTkLabel(self, text="--",
+                                         font=("JetBrains Mono", 14, "bold"),
+                                         text_color=COLORS["text"])
+        self._state_label.pack(anchor="w", padx=10, pady=(2, 0))
+
+        self._total_label = ctk.CTkLabel(self, text="",
+                                         font=("Inter", 11),
+                                         text_color=COLORS["text"])
+        self._total_label.pack(anchor="w", padx=10, pady=(2, 0))
+
+        self._breakdown_label = ctk.CTkLabel(self, text="",
+                                              font=("Inter", 11),
+                                              text_color=COLORS["text_sub"])
+        self._breakdown_label.pack(anchor="w", padx=10, pady=(0, 8))
+
+    def update_sleep(self, ss, sess):
+        ss_labels = {0: "Inactive", 1: "Awake", 8: "Light Sleep", 15: "Deep Sleep"}
+        ss_colors = {0: COLORS["text_sub"], 1: COLORS["yellow"],
+                     8: COLORS["blue"], 15: COLORS["green"]}
+        state_text = ss_labels.get(ss, f"State {ss}") if ss is not None else "-"
+        color = ss_colors.get(ss, COLORS["text"])
+
+        def _fmt(s):
+            if not s or s <= 0:
+                return "0m"
+            m = int(s) // 60
+            h, rm = divmod(m, 60)
+            return f"{h}h {rm}m" if h > 0 else f"{rm}m"
+
+        if sess.get("active"):
+            state_text += f" \u2014 {_fmt(sess.get('total_sleep_seconds', 0))} asleep"
+            self._total_label.configure(
+                text=f"Total session: {_fmt(sess.get('total_session_seconds', 0))}")
+            self._breakdown_label.configure(
+                text=f"\U0001f319 Deep: {_fmt(sess.get('deep_seconds', 0))}   "
+                     f"\U0001f4a4 Light: {_fmt(sess.get('light_seconds', 0))}   "
+                     f"\U0001f440 Awake: {_fmt(sess.get('awake_seconds', 0))}")
+        else:
+            self._total_label.configure(text="")
+            self._breakdown_label.configure(text="")
+
+        self._state_label.configure(text=state_text, text_color=color)
 
 
 class LoginFrame(ctk.CTkFrame):
@@ -317,13 +373,24 @@ class DashboardFrame(ctk.CTkFrame):
         self.tech_cards = {}
         tech_items = [
             ("onm", "Monitoring"), ("bp", "Band Placement"), ("mrs", "Monitor Ready"),
-            ("bso", "Base Station"), ("mvb", "Movement %"), ("ss", "Sleep State"),
+            ("bso", "Base Station"), ("mvb", "Movement %"),
             ("rsi", "WiFi Signal"), ("sc", "Sock Conn"), ("chg", "Charging"),
             ("bat", "Battery"), ("st", "Skin Temp"), ("sock_off", "Sock Off"),
         ]
+        # Sleep session panel spans columns 0-1 on the second row (index 5-6)
+        self.sleep_panel = SleepPanel(tech_grid)
+        self.sleep_panel.grid(row=0, column=4, columnspan=2,
+                              padx=4, pady=4, sticky="nsew")
         for i, (key, label) in enumerate(tech_items):
+            r = i // 6
+            c = i % 6
+            # Shift second-row items: first 5 fill row 0 cols 0-4, then row 1
+            if i < 5:
+                r, c = 0, i
+            else:
+                r, c = 1, (i - 5)
             card = TechCard(tech_grid, label)
-            card.grid(row=i // 6, column=i % 6, padx=4, pady=4, sticky="nsew")
+            card.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
             self.tech_cards[key] = card
 
         # Alert history summary on live vitals tab
@@ -432,11 +499,11 @@ class DashboardFrame(ctk.CTkFrame):
         self._alert_rows = []
 
     def set_connected(self):
-        self.status_badge.configure(text="Connected", fg_color="#d1fae5",
+        self.status_badge.configure(text="Live", fg_color="#d1fae5",
                                     text_color="#065f46")
 
     def set_disconnected(self):
-        self.status_badge.configure(text="Disconnected", fg_color="#fee2e2",
+        self.status_badge.configure(text="Offline", fg_color="#fee2e2",
                                     text_color="#991b1b")
 
     def show_warning(self, message, critical=False):
@@ -693,10 +760,7 @@ class DashboardFrame(ctk.CTkFrame):
         mvb = v.get("mvb")
         self.tech_cards["mvb"].set_value(f"{mvb}%" if mvb is not None else "-")
         ss = v.get("ss")
-        ss_labels = {0: "Inactive", 1: "Awake", 8: "Light Sleep", 15: "Deep Sleep"}
-        ss_colors = {0: COLORS["text_sub"], 1: COLORS["yellow"], 8: COLORS["blue"], 15: COLORS["green"]}
-        self.tech_cards["ss"].set_value(ss_labels.get(ss, f"State {ss}") if ss is not None else "-",
-                                        ss_colors.get(ss, COLORS["text"]))
+        self.sleep_panel.update_sleep(ss, meta.get("sleep_session", {}))
         rsi = v.get("rsi")
         self.tech_cards["rsi"].set_value(f"{rsi}%" if rsi else "-")
         sc = v.get("sc")
@@ -918,11 +982,13 @@ class OwletDesktopApp(ctk.CTk):
                 return
 
             sock = socks[0]
+            serial = sock.serial
             logger.info("Sock discovered, starting monitoring...")
 
             stale_count = 0
             max_stale_before_warning = 3
             max_lag_seconds = 30
+            sleep_start_checked = False
 
             while self._worker_running:
                 result = await sock.update_properties()
@@ -935,6 +1001,21 @@ class OwletDesktopApp(ctk.CTk):
 
                 if sock.raw_properties:
                     data = process_properties(sock.raw_properties)
+
+                    # One-time startup check: if baby is already sleeping,
+                    # query datapoint history to find when sleep started
+                    if not sleep_start_checked:
+                        sleep_start_checked = True
+                        if data['meta'].get('sleeping') and not data['meta'].get('sleep_session', {}).get('active'):
+                            try:
+                                start_ts = await find_sleep_start(api, serial)
+                                if start_ts:
+                                    set_sleep_start(start_ts)
+                                    logger.info(f"Sleep start seeded from datapoint history: {start_ts}")
+                                    data = process_properties(sock.raw_properties)
+                            except Exception as e:
+                                logger.warning(f"Sleep start lookup failed: {e}")
+
                     lag = data["meta"]["lag_seconds"]
 
                     if lag > max_lag_seconds:

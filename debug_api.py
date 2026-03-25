@@ -187,12 +187,13 @@ async def main():
 
         for i, entry in enumerate(devices_list):
             dev = entry.get("device", {})
+            dsn = dev.get("dsn", "unknown")
             print(f"\n{'='*60}")
             print(f"DEVICE {i+1}")
             print(f"{'='*60}")
             print(f"  product_name : {dev.get('product_name')}")
             print(f"  model        : {dev.get('model')}")
-            print(f"  dsn          : {dev.get('dsn')}")
+            print(f"  dsn          : {dsn}")
             print(f"  oem_model    : {dev.get('oem_model')}")
             print(f"  sw_version   : {dev.get('sw_version')}")
             print(f"  conn_status  : {dev.get('connection_status')}")
@@ -557,6 +558,43 @@ async def main():
                         print(f"    JSON: {json.dumps(parsed, indent=2)}")
                     except:
                         pass
+
+            # --- Datapoint history for sleep session analysis ---
+            print(f"\n{'='*60}")
+            print(f"DATAPOINT HISTORY (REAL_TIME_VITALS)")
+            print(f"{'='*60}")
+            try:
+                dp_resp = await api.request(
+                    "GET",
+                    f"/dsns/{dsn}/properties/REAL_TIME_VITALS/datapoints.json?limit=50&order=desc",
+                )
+                if isinstance(dp_resp, list) and dp_resp:
+                    print(f"  Retrieved {len(dp_resp)} datapoints (most recent first)\n")
+                    prev_ss = None
+                    for j, dp_entry in enumerate(dp_resp):
+                        d = dp_entry.get("datapoint", dp_entry)
+                        ts = d.get("updated_at") or d.get("created_at", "?")
+                        val = d.get("value", "")
+                        try:
+                            v = json.loads(val) if isinstance(val, str) else val
+                            ss = v.get("ss", "?")
+                            hr = v.get("hr", "?")
+                            bp = v.get("bp", "?")
+                            # Mark sleep transitions
+                            marker = ""
+                            if prev_ss is not None:
+                                if ss in (8, 15) and prev_ss not in (8, 15):
+                                    marker = " <-- WOKE UP (newer reading is awake)"
+                                elif ss not in (8, 15) and prev_ss in (8, 15):
+                                    marker = " <-- FELL ASLEEP (newer reading is sleep)"
+                            prev_ss = ss
+                            print(f"  [{j+1:2d}] {ts}  ss={ss:>2} hr={hr:>3} bp={bp:>2}{marker}")
+                        except Exception:
+                            print(f"  [{j+1:2d}] {ts}  (parse error)")
+                else:
+                    print("  No datapoints returned (API may not retain history for this property)")
+            except Exception as e:
+                print(f"  Error querying datapoints: {e}")
 
             print(f"\n{'='*60}")
             print(f"All files saved to: {os.path.abspath(log_dir)}/")

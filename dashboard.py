@@ -315,9 +315,17 @@ HTML_CONTENT = """
                 <div class="card-label">Movement %</div>
                 <div class="tech-val" id="mvb">--</div>
             </div>
-            <div class="tech-card">
-                <div class="card-label">Sleep State</div>
+            <div class="tech-card" id="sleep-panel" style="grid-column: span 2; min-width: 280px;">
+                <div class="card-label">Sleep Session</div>
                 <div class="tech-val" id="ss">--</div>
+                <div id="sleep-breakdown" style="display:none; margin-top:8px; font-size:0.82rem; color:#6b7280; line-height:1.6;">
+                    <div>Total session: <span id="sleep-total" style="font-weight:600; color:#374151;">--</span></div>
+                    <div style="display:flex; gap:12px; margin-top:2px;">
+                        <span>🌙 Deep: <b id="sleep-deep">--</b></span>
+                        <span>💤 Light: <b id="sleep-light">--</b></span>
+                        <span>👀 Awake: <b id="sleep-awake">--</b></span>
+                    </div>
+                </div>
             </div>
             <div class="tech-card">
                 <div class="card-label">WiFi Signal</div>
@@ -398,12 +406,12 @@ HTML_CONTENT = """
 
     // Update connection status badge when WebSocket opens
     ws.onopen = () => {
-        document.getElementById("status").innerText = "Connected";
+        document.getElementById("status").innerText = "Live";
         document.getElementById("status").className = "status-badge status-connected";
     };
     // Update connection status badge when WebSocket closes
     ws.onclose = () => {
-        document.getElementById("status").innerText = "Disconnected";
+        document.getElementById("status").innerText = "Offline";
         document.getElementById("status").className = "status-badge status-disconnected";
     };
 
@@ -753,8 +761,28 @@ HTML_CONTENT = """
         const ssLabels = {0: "Inactive", 1: "Awake", 8: "Light Sleep", 15: "Deep Sleep"};
         const ssColors = {0: "#9ca3af", 1: "#f59e0b", 8: "#3b82f6", 15: "#10b981"};
         const ssEl = document.getElementById("ss");
-        ssEl.innerText = v.ss != null ? (ssLabels[v.ss] || "State " + v.ss) : "-";
+        let ssText = v.ss != null ? (ssLabels[v.ss] || "State " + v.ss) : "-";
         ssEl.style.color = ssColors[v.ss] || "#374151";
+
+        // Sleep session breakdown (session ends only on dock)
+        const sess = meta.sleep_session || {};
+        const breakdownEl = document.getElementById("sleep-breakdown");
+        if (sess.active) {
+            function fmtDur(s) {
+                if (!s || s <= 0) return "0m";
+                const m = Math.floor(s / 60), h = Math.floor(m / 60), rm = m % 60;
+                return h > 0 ? `${h}h ${rm}m` : `${rm}m`;
+            }
+            ssText += " — " + fmtDur(sess.total_sleep_seconds) + " asleep";
+            document.getElementById("sleep-total").innerText = fmtDur(sess.total_session_seconds);
+            document.getElementById("sleep-deep").innerText = fmtDur(sess.deep_seconds);
+            document.getElementById("sleep-light").innerText = fmtDur(sess.light_seconds);
+            document.getElementById("sleep-awake").innerText = fmtDur(sess.awake_seconds);
+            breakdownEl.style.display = "block";
+        } else {
+            breakdownEl.style.display = "none";
+        }
+        ssEl.innerText = ssText;
         document.getElementById("rsi").innerText = v.rsi ? v.rsi + "%" : "-";
         
         const scEl = document.getElementById("sc");

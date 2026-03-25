@@ -10,6 +10,96 @@ import json
 from datetime import datetime, timezone
 
 
+# --- Sleep session tracking (persists across calls) ---
+# A session starts when ss first enters 8 or 15, and only ends when
+# the sock is docked (chg==1 or chg==2).  Brief awakenings during the
+# session are normal and do NOT close the session.
+_sleep_session = {
+    "active": False,     # whether a session is in progress
+    "start_ts": None,    # Unix epoch when session began (server-side)
+    "last_ts": None,     # Unix epoch of last processed reading
+    "last_ss": None,     # previous ss value
+    "light_secs": 0.0,   # accumulated seconds in Light Sleep (ss=8)
+    "deep_secs": 0.0,    # accumulated seconds in Deep Sleep (ss=15)
+    "awake_secs": 0.0,   # accumulated seconds awake *during* session (ss=1)
+}
+
+
+def set_sleep_start(epoch: float):
+    """Seed the sleep session from an external source (e.g. datapoint history)."""
+    _sleep_session["active"] = True
+    _sleep_session["start_ts"] = epoch
+    # We don't know state breakdown from history, so leave counters at 0;
+    # they'll accumulate from this point on.
+    _sleep_session["last_ts"] = epoch
+
+
+def reset_sleep_session():
+    """Close the current sleep session (called when sock is docked)."""
+    _sleep_session["active"] = False
+    _sleep_session["start_ts"] = None
+    _sleep_session["last_ts"] = None
+    _sleep_session["last_ss"] = None
+    _sleep_session["light_secs"] = 0.0
+    _sleep_session["deep_secs"] = 0.0
+    _sleep_session["awake_secs"] = 0.0
+
+
+async def find_sleep_start(api, dsn: str) -> float | None:
+    """Query Ayla datapoint history to find when the current sleep session began.
+
+    Walks backwards through recent REAL_TIME_VITALS datapoints looking for
+    the earliest consecutive sleeping reading (not interrupted by docking).
+
+    Returns the Unix epoch of the sleep start, or None if not found.
+    """
+    try:
+        resp = await api.request(
+            "GET",
+            f"/dsns/{dsn}/properties/REAL_TIME_VITALS/datapoints.json?limit=500&order=desc",
+        )
+    except Exception:
+        return None
+
+    if not isinstance(resp, list) or not resp:
+        return None
+
+    # Walk from most recent backwards; find where the session started.
+    # The session boundary is a docking event (chg==1 or chg==2) or
+    # reaching the end of available history.
+    last_sleep_ts = None
+    for dp in resp:
+        d = dp.get("datapoint", dp)
+        val = d.get("value", "")
+        try:
+            v = json.loads(val) if isinstance(val, str) else val
+        except Exception:
+            continue
+        if not isinstance(v, dict):
+            continue
+
+        ss = v.get("ss")
+        chg = v.get("chg", 0)
+
+        ts_str = d.get("updated_at") or d.get("created_at")
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+
+        # If we hit a docking event, the session started after this point
+        if chg in (1, 2):
+            break
+
+        if ss in (8, 15):
+            last_sleep_ts = ts  # keep going further back
+        # ss=1 (awake) during session is fine — keep walking
+
+    return last_sleep_ts
+
+
 def robust_json_parse(value):
     """
     Safely parse JSON strings into Python objects.
@@ -269,26 +359,65 @@ def process_properties(raw_props, alerts=None):
     # LIR truth table: if LOW_INTEG_READ is set OR both vitals are zero/flagged
     lir = lir_flag or (not bpm_integ and not spo2_integ)
 
-    # Base station disconnected: no base station AND no signal
-    base_dc = (bso_val != 1) and lir
-
-    if base_dc:
+    # Determine device state — charging takes priority over disconnect detection
+    # because when docked, bso=0 and hr/ox=0 (LIR=true) but that's normal.
+    if chg_val == 1:
+        device_state = "Charging"
+    elif chg_val == 2:
+        device_state = "Charged"
+    elif lir and bso_val != 1:
         device_state = "Disconnected"
     elif lir:
-        if chg_val == 1:
-            device_state = "Charging"
-        elif chg_val == 2:
-            device_state = "Charged"
-        else:
-            device_state = "No Signal"
+        device_state = "No Signal"
     else:
         device_state = "Monitoring"
 
     # --- Motion artifact detection ---
-    # High movement corrupts pulse oximetry readings. When mvb >= 50%,
-    # HR and SpO2 values are unreliable (motion artifact).
     mvb_val = vitals.get("mvb", 0) or 0
     motion_artifact = mvb_val >= 50
+
+    # --- Sleep session tracking ---
+    # Session starts when ss first enters 8 or 15.
+    # Session ends ONLY when the sock is docked (chg == 1 or 2).
+    # Brief awakenings (ss=1) during a session are normal and tracked separately.
+    ss_val = vitals.get("ss")
+    sleeping = ss_val in (8, 15)
+    in_session_awake = ss_val == 1 and _sleep_session["active"]
+
+    # Docking ends the session
+    if chg_val in (1, 2) and _sleep_session["active"]:
+        reset_sleep_session()
+
+    # Start a new session on first sleep after no session
+    if sleeping and not _sleep_session["active"]:
+        _sleep_session["active"] = True
+        _sleep_session["start_ts"] = last_update_ts
+        _sleep_session["last_ts"] = last_update_ts
+        _sleep_session["last_ss"] = ss_val
+        _sleep_session["light_secs"] = 0.0
+        _sleep_session["deep_secs"] = 0.0
+        _sleep_session["awake_secs"] = 0.0
+
+    # Accumulate time in current state
+    if _sleep_session["active"] and last_update_ts and _sleep_session["last_ts"]:
+        delta = last_update_ts - _sleep_session["last_ts"]
+        if 0 < delta < 300:  # ignore gaps > 5 min (connection loss)
+            prev_ss = _sleep_session["last_ss"]
+            if prev_ss == 8:
+                _sleep_session["light_secs"] += delta
+            elif prev_ss == 15:
+                _sleep_session["deep_secs"] += delta
+            elif prev_ss == 1:
+                _sleep_session["awake_secs"] += delta
+
+    if _sleep_session["active"]:
+        _sleep_session["last_ts"] = last_update_ts
+        _sleep_session["last_ss"] = ss_val
+
+    # Build sleep meta
+    session_active = _sleep_session["active"]
+    total_sleep = _sleep_session["light_secs"] + _sleep_session["deep_secs"]
+    total_session = total_sleep + _sleep_session["awake_secs"]
 
     return {
         "vitals": vitals,
@@ -301,5 +430,14 @@ def process_properties(raw_props, alerts=None):
         "meta": {
             "lag_seconds": round(lag, 1),
             "motion_artifact": motion_artifact,
+            "sleeping": sleeping,
+            "sleep_session": {
+                "active": session_active,
+                "total_session_seconds": round(total_session),
+                "total_sleep_seconds": round(total_sleep),
+                "light_seconds": round(_sleep_session["light_secs"]),
+                "deep_seconds": round(_sleep_session["deep_secs"]),
+                "awake_seconds": round(_sleep_session["awake_secs"]),
+            },
         },
     }
