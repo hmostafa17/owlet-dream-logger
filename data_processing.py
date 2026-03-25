@@ -31,25 +31,39 @@ def robust_json_parse(value):
 
 
 def _decode_alert_history(raw_props):
-    """Decode RED_ALERT_SUMMARY base64 field into alert event records."""
+    """Decode RED_ALERT_SUMMARY base64 field into alert event records.
+    Returns dict with 'records' list, 'updated_at' (property timestamp), and 'header_epoch' (if decodable).
+    """
     ALERT_TYPE_NAMES = {
         1: "Low Oxygen", 2: "Critical Oxygen", 3: "Low HR",
         4: "High HR", 5: "Critical Battery", 6: "General",
         7: "Sock Off", 8: "Sock Disconnected",
     }
+    empty = {"records": [], "updated_at": None, "header_epoch": None}
     if "RED_ALERT_SUMMARY" not in raw_props:
-        return []
+        return empty
     prop = raw_props["RED_ALERT_SUMMARY"]
+    updated_at = prop.get("data_updated_at") if isinstance(prop, dict) else None
     val = prop.get("value") if isinstance(prop, dict) else prop
     if not val or val == "None" or not isinstance(val, str):
-        return []
+        return {**empty, "updated_at": updated_at}
     try:
         padded = str(val) + "=" * (-len(str(val)) % 4)
         decoded = base64.b64decode(padded)
     except Exception:
-        return []
+        return {**empty, "updated_at": updated_at}
     if len(decoded) < 15:
-        return []
+        return {**empty, "updated_at": updated_at}
+
+    # Try to extract a Unix epoch from header bytes 0-3 (big-endian)
+    import struct
+    header_epoch = None
+    if len(decoded) >= 4:
+        candidate = struct.unpack(">I", decoded[0:4])[0]
+        # Plausible epoch: between 2020-01-01 and 2030-01-01
+        if 1577836800 <= candidate <= 1893456000:
+            header_epoch = datetime.fromtimestamp(candidate, tz=timezone.utc).isoformat()
+
     records = []
     i = 10  # skip header
     while i + 5 <= len(decoded):
@@ -61,8 +75,9 @@ def _decode_alert_history(raw_props):
             "hr": hr, "ox": ox, "duration": duration,
             "type": alert_type,
             "type_name": ALERT_TYPE_NAMES.get(alert_type, f"Type {alert_type}"),
+            "flags": flags,
         })
-    return records
+    return {"records": records, "updated_at": updated_at, "header_epoch": header_epoch}
 
 
 def _extract_device_info(raw_props):
@@ -166,7 +181,7 @@ def process_properties(raw_props, alerts=None):
                 "rsi": d.get("rsi"),    # WiFi/BLE signal strength indicator
                 "ss": d.get("ss"),      # Sleep state (0=inactive, 1=awake, 8=light, 15=deep)
                 "sc": d.get("sc"),      # Sock-to-base connection (2=connected)
-                "bp": d.get("bp"),      # Band placement state (7=idle, 1=calibrating, 10=monitoring, 6=degraded)
+                "bp": d.get("bp"),      # Band placement state (7=idle, 1=calibrating, 8=stabilizing, 9=acquiring, 10=monitoring, 11=settling, 6=degraded)
                 "hw": d.get("hw"),      # Hardware version (e.g. "obs4")
                 "bsb": d.get("bsb"),    # Base station battery backup status
                 "onm": d.get("onm"),    # Wellness alert / monitoring mode (3=active)
@@ -189,12 +204,23 @@ def process_properties(raw_props, alerts=None):
         "SOCK_OFF": "sock_off",
         "LOST_POWER_ALRT": "lost_power",
         "DISCOMFORT_ALRT": "discomfort",
+        "LOW_INTEG_READ": "low_integrity_read",
     }
     for raw_key, friendly_key in alert_keys.items():
         if raw_key in raw_props and isinstance(raw_props[raw_key], dict):
             val = raw_props[raw_key].get("value")
             if val in (1, True, "1", "true"):
                 alert_flags[friendly_key] = True
+
+    # Extract alarm priority levels (PREVIEW_*_PRIORITY_ALARM)
+    alarm_priority = None
+    for level in ("HIGH", "MED", "LOW"):
+        key = f"PREVIEW_{level}_PRIORITY_ALARM"
+        if key in raw_props and isinstance(raw_props[key], dict):
+            val = raw_props[key].get("value")
+            if val in (1, True, "1", "true"):
+                alarm_priority = level
+                break  # highest active priority wins
 
     # If normalized alerts from sock.properties are provided, merge them
     if alerts:
@@ -227,11 +253,53 @@ def process_properties(raw_props, alerts=None):
     device_info = _extract_device_info(raw_props)
     alert_history = _decode_alert_history(raw_props)
 
+    # --- Compute Device State (jlamendo LIR truth table) ---
+    # LOW_INTEG_READ = sock connected but sensor can't get a valid reading (yellow light)
+    # Combine with actual HR/SpO2 to determine true state
+    lir_flag = alert_flags.get("low_integrity_read", False)
+    hr_val = vitals.get("hr", 0) or 0
+    ox_val = vitals.get("ox", 0) or 0
+    chg_val = vitals.get("chg", 0) or 0
+    bso_val = vitals.get("bso", 0) or 0
+
+    # Integrity checks: is each vital reading valid and not flagged?
+    bpm_integ = hr_val > 0 and not alert_flags.get("low_heart_rate", False)
+    spo2_integ = ox_val > 0 and not alert_flags.get("low_oxygen", False)
+
+    # LIR truth table: if LOW_INTEG_READ is set OR both vitals are zero/flagged
+    lir = lir_flag or (not bpm_integ and not spo2_integ)
+
+    # Base station disconnected: no base station AND no signal
+    base_dc = (bso_val != 1) and lir
+
+    if base_dc:
+        device_state = "Disconnected"
+    elif lir:
+        if chg_val == 1:
+            device_state = "Charging"
+        elif chg_val == 2:
+            device_state = "Charged"
+        else:
+            device_state = "No Signal"
+    else:
+        device_state = "Monitoring"
+
+    # --- Motion artifact detection ---
+    # High movement corrupts pulse oximetry readings. When mvb >= 50%,
+    # HR and SpO2 values are unreliable (motion artifact).
+    mvb_val = vitals.get("mvb", 0) or 0
+    motion_artifact = mvb_val >= 50
+
     return {
         "vitals": vitals,
         "alerts": alert_flags,
+        "alarm_priority": alarm_priority,
+        "device_state": device_state,
         "all_properties": table_data,
         "device_info": device_info,
         "alert_history": alert_history,
-        "meta": {"lag_seconds": round(lag, 1)}
+        "meta": {
+            "lag_seconds": round(lag, 1),
+            "motion_artifact": motion_artifact,
+        },
     }

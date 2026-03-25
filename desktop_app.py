@@ -234,6 +234,20 @@ class DashboardFrame(ctk.CTkFrame):
         btn_frame = ctk.CTkFrame(header, fg_color="transparent")
         btn_frame.pack(side="right")
 
+        self.device_state_badge = ctk.CTkLabel(btn_frame, text="",
+                                                  font=("Inter", 11, "bold"),
+                                                  fg_color=COLORS["border"],
+                                                  corner_radius=12, padx=10, pady=4)
+        self.device_state_badge.pack(side="left", padx=(0, 6))
+
+        self.alarm_badge = ctk.CTkLabel(btn_frame, text="",
+                                        font=("Inter", 11, "bold"),
+                                        fg_color=COLORS["border"],
+                                        corner_radius=12, padx=10, pady=4)
+        self.alarm_badge.pack(side="left", padx=(0, 6))
+        self.alarm_badge.pack_forget()
+        self._alarm_visible = False
+
         self.status_badge = ctk.CTkLabel(btn_frame, text="Connecting...",
                                          font=("Inter", 12, "bold"),
                                          fg_color=COLORS["border"],
@@ -466,7 +480,40 @@ class DashboardFrame(ctk.CTkFrame):
         meta = data.get("meta", {})
         alerts = data.get("alerts", {})
         device_info = data.get("device_info", {})
-        alert_history = data.get("alert_history", [])
+        alert_history_data = data.get("alert_history", {})
+        alert_history = alert_history_data.get("records", []) if isinstance(alert_history_data, dict) else alert_history_data
+        alert_history_ts = alert_history_data.get("updated_at") if isinstance(alert_history_data, dict) else None
+        alert_history_epoch = alert_history_data.get("header_epoch") if isinstance(alert_history_data, dict) else None
+        device_state = data.get("device_state", "Unknown")
+        alarm_priority = data.get("alarm_priority")
+
+        # --- Device State Badge ---
+        state_config = {
+            "Monitoring": ("#d1fae5", "#065f46"),
+            "Charging": ("#ede9fe", "#5b21b6"),
+            "Charged": ("#dbeafe", "#1e40af"),
+            "No Signal": ("#fef3c7", "#92400e"),
+            "Disconnected": ("#fee2e2", "#991b1b"),
+        }
+        bg, fg = state_config.get(device_state, (COLORS["border"], COLORS["text"]))
+        self.device_state_badge.configure(text=device_state, fg_color=bg, text_color=fg)
+
+        # --- Alarm Priority Badge ---
+        if alarm_priority:
+            prio_config = {
+                "HIGH": ("#fee2e2", "#991b1b", "\u26a0 HIGH"),
+                "MED": ("#fef3c7", "#92400e", "\u26a0 MED"),
+                "LOW": ("#dbeafe", "#1e40af", "\u26a0 LOW"),
+            }
+            p_bg, p_fg, p_text = prio_config.get(alarm_priority, (COLORS["border"], COLORS["text"], alarm_priority))
+            self.alarm_badge.configure(text=p_text, fg_color=p_bg, text_color=p_fg)
+            if not self._alarm_visible:
+                self.alarm_badge.pack(side="left", padx=(0, 6), before=self.status_badge)
+                self._alarm_visible = True
+        else:
+            if self._alarm_visible:
+                self.alarm_badge.pack_forget()
+                self._alarm_visible = False
 
         # --- Device Alerts ---
         active_alerts = []
@@ -480,6 +527,7 @@ class DashboardFrame(ctk.CTkFrame):
         if alerts.get("sock_off"): active_alerts.append("Sock Off")
         if alerts.get("lost_power"): active_alerts.append("Lost Power")
         if alerts.get("discomfort"): active_alerts.append("Discomfort")
+        if alerts.get("low_integrity_read"): active_alerts.append("Low Signal (Yellow)")
 
         if active_alerts:
             has_critical = any(alerts.get(k) for k in
@@ -497,17 +545,26 @@ class DashboardFrame(ctk.CTkFrame):
             self._hr_stale_count = 0
             self._last_hr = current_hr
 
-        # Heart rate with color coding
+        # Motion artifact detection
+        mvb = v.get("mvb") or 0
+        motion_artifact = meta.get("motion_artifact", False)
+
+        # Heart rate with color coding (softened during motion artifact)
         hr_color = COLORS["text"]
         if current_hr is not None:
-            if 100 <= current_hr <= 160:
+            if motion_artifact and (current_hr > 160 or current_hr < 90):
+                hr_color = COLORS["yellow"]  # soften to yellow during movement
+            elif 100 <= current_hr <= 160:
                 hr_color = COLORS["green"]
             elif (90 <= current_hr < 100) or (160 < current_hr <= 180):
                 hr_color = COLORS["yellow"]
             elif current_hr < 90 or current_hr > 180:
                 hr_color = COLORS["red"]
         self.hr_card.set_value(current_hr, hr_color)
-        self.hr_card.set_sub("● 100-160 Normal  ● 90-99 Alert  ● <90/>180 Critical")
+        if motion_artifact:
+            self.hr_card.set_sub("⚡ Motion artifact — reading may be inaccurate")
+        else:
+            self.hr_card.set_sub("● 100-160 Normal  ● 90-99 Alert  ● <90/>180 Critical")
 
         # Quality badge on HR card based on band placement state
         bp = v.get("bp")
@@ -515,8 +572,16 @@ class DashboardFrame(ctk.CTkFrame):
 
         if is_charging:
             self.hr_card.set_badge("DOCKED", "#ede9fe", "#5b21b6")
+        elif motion_artifact:
+            self.hr_card.set_badge("MOVING", "#fef3c7", "#92400e")
         elif bp == 10:
             self.hr_card.set_badge("LIVE", "#d1fae5", "#065f46")
+        elif bp == 11:
+            self.hr_card.set_badge("SETTLING", "#dbeafe", "#1e40af")
+        elif bp == 9:
+            self.hr_card.set_badge("ACQUIRING", "#dbeafe", "#1e40af")
+        elif bp == 8:
+            self.hr_card.set_badge("STABILIZING", "#fef3c7", "#92400e")
         elif bp == 1:
             self.hr_card.set_badge("CALIBRATING", "#fef3c7", "#92400e")
         elif bp == 6:
@@ -526,11 +591,13 @@ class DashboardFrame(ctk.CTkFrame):
         else:
             self.hr_card.set_badge("", COLORS["border"], COLORS["text"])
 
-        # Oxygen with color coding
+        # Oxygen with color coding (softened during motion artifact)
         ox = v.get("ox")
         ox_color = COLORS["text"]
         if ox is not None:
-            if ox >= 95:
+            if motion_artifact and ox < 95:
+                ox_color = COLORS["yellow"]  # soften during movement
+            elif ox >= 95:
                 ox_color = COLORS["blue"]
             elif ox >= 90:
                 ox_color = COLORS["yellow"]
@@ -539,20 +606,37 @@ class DashboardFrame(ctk.CTkFrame):
         self.ox_card.set_value(ox, ox_color)
         oxta = v.get("oxta")
         oxta_text = f"Avg: {oxta}%" if oxta and oxta != 255 else "Avg: --"
-        self.ox_card.set_sub(f"{oxta_text}  ● ≥95 Normal  ● 90-94 Low  ● <90 Critical")
+        if motion_artifact:
+            self.ox_card.set_sub(f"{oxta_text}  ⚡ Motion artifact")
+        else:
+            self.ox_card.set_sub(f"{oxta_text}  ● ≥95 Normal  ● 90-94 Low  ● <90 Critical")
 
-        # Movement with progress bar
-        mvb = v.get("mvb")
+        # Movement with progress bar and color coding
         mv = v.get("mv")
         if mvb is not None:
             mvb_clamped = max(0, min(100, mvb))
             self.mv_card.set_progress(mvb_clamped)
-            self.mv_card.set_value(f"{mvb_clamped}%", COLORS["text"])
+            if mvb_clamped >= 50:
+                mv_color = COLORS["red"]
+            elif mvb_clamped >= 25:
+                mv_color = COLORS["yellow"]
+            else:
+                mv_color = COLORS["green"]
+            self.mv_card.set_value(f"{mvb_clamped}%", mv_color)
             self.mv_card.set_sub(f"Raw intensity (mv): {mv}")
         else:
             self.mv_card.set_value(None)
             self.mv_card.set_progress(0)
             self.mv_card.set_sub(f"Raw intensity (mv): {mv}" if mv else "")
+
+        # --- Wake detection ---
+        ss = v.get("ss")
+        if not hasattr(self, '_last_ss'):
+            self._last_ss = ss
+        if self._last_ss in (8, 15) and ss == 1:
+            # Baby transitioned from sleep to awake
+            self.show_alerts("👶 Baby woke up!", critical=False)
+        self._last_ss = ss
 
         # Lag
         lag = meta.get("lag_seconds")
@@ -584,6 +668,8 @@ class DashboardFrame(ctk.CTkFrame):
         bp_text, bp_color = f"Code {bp}", COLORS["text"]
         if is_charging:
             bp_text, bp_color = "Docked/Charging", COLORS["purple"]
+        elif bp == 1 and motion_artifact:
+            bp_text, bp_color = "Moving (1)", COLORS["yellow"]
         elif bp == 1:
             bp_text, bp_color = "Calibrating (1)", COLORS["yellow"]
         elif bp == 6:
@@ -591,9 +677,13 @@ class DashboardFrame(ctk.CTkFrame):
         elif bp == 7:
             bp_text, bp_color = "Idle/Docked (7)", COLORS["purple"]
         elif bp == 8:
-            bp_text, bp_color = "Docked (8)", COLORS["purple"]
+            bp_text, bp_color = "Stabilizing (8)", COLORS["yellow"]
+        elif bp == 9:
+            bp_text, bp_color = "Acquiring (9)", COLORS["blue"]
         elif bp == 10:
             bp_text, bp_color = "Monitoring (10)", COLORS["green"]
+        elif bp == 11:
+            bp_text, bp_color = "Settling (11)", COLORS["blue"]
         self.tech_cards["bp"].set_value(bp_text, bp_color)
 
         bso = v.get("bso")
@@ -666,9 +756,9 @@ class DashboardFrame(ctk.CTkFrame):
             self.summary_cards["ox_range"].set_value("--", COLORS["text_sub"])
 
         # --- Raw Data table ---
-        self._update_insights(device_info, alert_history)
+        self._update_insights(device_info, alert_history, alert_history_ts, alert_history_epoch)
 
-    def _update_insights(self, device_info, alert_history):
+    def _update_insights(self, device_info, alert_history, alert_ts=None, alert_epoch=None):
         """Update the Device Insights tab with firmware, settings, and alert history."""
         # Device info cards
         for key, card in self.info_cards.items():
@@ -701,7 +791,12 @@ class DashboardFrame(ctk.CTkFrame):
                 card.set_value("--", COLORS["text_sub"])
 
         # Alert history table
-        self.alert_count_label.configure(text=f"{len(alert_history)} events")
+        ts_display = ""
+        if alert_epoch:
+            ts_display = f" (since {alert_epoch[:10]})"
+        elif alert_ts:
+            ts_display = f" (updated {alert_ts[:10]})"
+        self.alert_count_label.configure(text=f"{len(alert_history)} events{ts_display}")
 
         # Only rebuild if count changed
         if len(self._alert_rows) // 5 != len(alert_history):

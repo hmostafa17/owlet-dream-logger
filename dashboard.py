@@ -196,6 +196,22 @@ HTML_CONTENT = """
         .alert-icon { font-size: 1.3rem; flex-shrink: 0; }
         .alert-text { flex: 1; }
 
+        /* Device State & Alarm Priority Badges */
+        .state-badge {
+            padding: 6px 14px;
+            border-radius: 99px;
+            font-size: 0.8rem;
+            font-weight: 700;
+        }
+        .alarm-badge {
+            padding: 6px 14px;
+            border-radius: 99px;
+            font-size: 0.8rem;
+            font-weight: 700;
+            display: none;
+        }
+        .alarm-badge.show { display: inline-block; }
+
     </style>
 </head>
 <body>
@@ -203,6 +219,8 @@ HTML_CONTENT = """
         <header>
             <h1>Owlet Dream Logger</h1>
             <div class="header-right">
+                <div id="deviceState" class="state-badge" style="background:#e5e7eb;color:#374151">--</div>
+                <div id="alarmPriority" class="alarm-badge">--</div>
                 <div id="status" class="status-badge">Connecting...</div>
                 <button id="logoutBtn" class="btn-logout">Logout</button>
                 <button id="quitBtn" class="btn-quit">Quit App</button>
@@ -232,7 +250,7 @@ HTML_CONTENT = """
                     <span id="hr">--</span> <span class="unit">BPM</span>
                     <span id="hr-quality" class="quality-badge" style="display:none">--</span>
                 </div>
-                <div class="card-sub">
+                <div class="card-sub" id="hr-sub">
                     <span style="color: #10b981;">●</span> 100-160 Normal
                     <span style="color: #f59e0b; margin-left: 8px;">●</span> 90-99, 161-180 Alert
                     <span style="color: #ef4444; margin-left: 8px;">●</span> &lt;90, &gt;180 Low/High
@@ -242,7 +260,7 @@ HTML_CONTENT = """
             <div class="card">
                 <div class="card-label">Oxygen (SpO2)</div>
                 <div class="card-value c-ox"><span id="ox">--</span> <span class="unit">%</span></div>
-                <div class="card-sub">
+                <div class="card-sub" id="ox-sub">
                     Avg: <span id="oxta">--</span>% 
                     <span style="margin-left: 10px;">
                         <span style="color: #3b82f6;">●</span> ≥95 Normal
@@ -398,6 +416,39 @@ HTML_CONTENT = """
         const props = payload.all_properties || [];
         const meta = payload.meta || {};
         const alerts = payload.alerts || {};
+        const deviceState = payload.device_state || "Unknown";
+        const alarmPriority = payload.alarm_priority;
+
+        // --- DEVICE STATE BADGE ---
+        const stateEl = document.getElementById("deviceState");
+        const stateConfig = {
+            "Monitoring": ["#d1fae5", "#065f46"],
+            "Charging": ["#ede9fe", "#5b21b6"],
+            "Charged": ["#dbeafe", "#1e40af"],
+            "No Signal": ["#fef3c7", "#92400e"],
+            "Disconnected": ["#fee2e2", "#991b1b"],
+        };
+        const [sBg, sFg] = stateConfig[deviceState] || ["#e5e7eb", "#374151"];
+        stateEl.innerText = deviceState;
+        stateEl.style.background = sBg;
+        stateEl.style.color = sFg;
+
+        // --- ALARM PRIORITY BADGE ---
+        const alarmEl = document.getElementById("alarmPriority");
+        if (alarmPriority) {
+            const prioConfig = {
+                "HIGH": ["#fee2e2", "#991b1b", "\u26a0 HIGH"],
+                "MED": ["#fef3c7", "#92400e", "\u26a0 MED"],
+                "LOW": ["#dbeafe", "#1e40af", "\u26a0 LOW"],
+            };
+            const [pBg, pFg, pText] = prioConfig[alarmPriority] || ["#e5e7eb", "#374151", alarmPriority];
+            alarmEl.innerText = pText;
+            alarmEl.style.background = pBg;
+            alarmEl.style.color = pFg;
+            alarmEl.classList.add("show");
+        } else {
+            alarmEl.classList.remove("show");
+        }
 
         // --- DEVICE ALERTS ---
         const alertBanner = document.getElementById("alertBanner");
@@ -413,6 +464,7 @@ HTML_CONTENT = """
         if (alerts.sock_disconnected) activeAlerts.push("🟠 Sock Disconnected");
         if (alerts.sock_off) activeAlerts.push("🟠 Sock Off");
         if (alerts.lost_power) activeAlerts.push("🔴 Lost Power");
+        if (alerts.low_integrity_read) activeAlerts.push("🟡 Low Signal (Yellow)");
 
         if (activeAlerts.length > 0) {
             const hasCritical = alerts.critical_oxygen || alerts.low_heart_rate
@@ -458,41 +510,52 @@ HTML_CONTENT = """
         // Update primary vitals display (heart rate, oxygen saturation)
         const hrElement = document.getElementById("hr");
         hrElement.innerText = currentHr ?? "--";
-        
-        // Dynamic heart rate color coding based on baby heart rate ranges
+
+        // Motion artifact detection
+        const mvbVal = v.mvb ?? 0;
+        const motionArtifact = meta.motion_artifact || false;
+        const hrSubEl = document.getElementById("hr-sub");
+        const oxSubEl = document.getElementById("ox-sub");
+
+        // Dynamic heart rate color coding (softened during motion artifact)
         if (currentHr && currentHr !== "--") {
-            if (currentHr >= 100 && currentHr <= 160) {
-                // Normal range - green
+            if (motionArtifact && (currentHr > 160 || currentHr < 90)) {
+                // Movement-affected — soften to yellow instead of red
+                hrElement.parentElement.style.color = "#f59e0b";
+            } else if (currentHr >= 100 && currentHr <= 160) {
                 hrElement.parentElement.style.color = "#10b981";
             } else if ((currentHr >= 90 && currentHr < 100) || (currentHr > 160 && currentHr <= 180)) {
-                // Slightly concerning - orange/yellow
                 hrElement.parentElement.style.color = "#f59e0b";
             } else {
-                // Very concerning - red
                 hrElement.parentElement.style.color = "#ef4444";
             }
         } else {
-            // No data - default gray
             hrElement.parentElement.style.color = "#6b7280";
+        }
+        if (motionArtifact) {
+            hrSubEl.innerHTML = '⚡ <b>Motion artifact</b> — reading may be inaccurate';
+            hrSubEl.style.color = '#f59e0b';
+        } else {
+            hrSubEl.innerHTML = '<span style="color:#10b981;">●</span> 100-160 Normal <span style="color:#f59e0b;margin-left:8px;">●</span> 90-99, 161-180 Alert <span style="color:#ef4444;margin-left:8px;">●</span> &lt;90, &gt;180 Low/High';
+            hrSubEl.style.color = '';
         }
         
         document.getElementById("ox").innerText = v.ox ?? "--";
         
-        // Dynamic oxygen saturation color coding
+        // Dynamic oxygen saturation color coding (softened during motion artifact)
         const oxElement = document.getElementById("ox");
         if (v.ox && v.ox !== "--") {
-            if (v.ox >= 95) {
-                // Normal range - blue (keeping brand color)
+            if (motionArtifact && v.ox < 95) {
+                // Movement-affected — soften to yellow
+                oxElement.parentElement.style.color = "#f59e0b";
+            } else if (v.ox >= 95) {
                 oxElement.parentElement.style.color = "#3b82f6";
             } else if (v.ox >= 90 && v.ox < 95) {
-                // Slightly low - orange/yellow
                 oxElement.parentElement.style.color = "#f59e0b";
             } else {
-                // Concerning - red
                 oxElement.parentElement.style.color = "#ef4444";
             }
         } else {
-            // No data - default gray
             oxElement.parentElement.style.color = "#6b7280";
         }
 
@@ -500,6 +563,12 @@ HTML_CONTENT = """
             document.getElementById("oxta").innerText = v.oxta;
         } else {
             document.getElementById("oxta").innerText = "--";
+        }
+        if (motionArtifact) {
+            oxSubEl.innerHTML = 'Avg: ' + (v.oxta && v.oxta !== 255 ? v.oxta : '--') + '% ⚡ <b>Motion artifact</b>';
+            oxSubEl.style.color = '#f59e0b';
+        } else {
+            oxSubEl.style.color = '';
         }
 
         // --- 3. QUALITY / STATUS BADGE ---
@@ -526,10 +595,26 @@ HTML_CONTENT = """
             qualEl.innerText = "FROZEN"; 
             qualEl.style.backgroundColor = "#fee2e2"; 
             qualEl.style.color = "#991b1b";
+        } else if (motionArtifact) {
+            qualEl.innerText = "MOVING";
+            qualEl.style.backgroundColor = "#fef3c7";
+            qualEl.style.color = "#92400e";
         } else if (bp === 10) {
             qualEl.innerText = "LIVE";
             qualEl.style.backgroundColor = "#d1fae5";
             qualEl.style.color = "#065f46";
+        } else if (bp === 11) {
+            qualEl.innerText = "SETTLING";
+            qualEl.style.backgroundColor = "#dbeafe";
+            qualEl.style.color = "#1e40af";
+        } else if (bp === 9) {
+            qualEl.innerText = "ACQUIRING";
+            qualEl.style.backgroundColor = "#dbeafe";
+            qualEl.style.color = "#1e40af";
+        } else if (bp === 8) {
+            qualEl.innerText = "STABILIZING";
+            qualEl.style.backgroundColor = "#fef3c7";
+            qualEl.style.color = "#92400e";
         } else if (bp === 1) {
             qualEl.innerText = "CALIBRATING";
             qualEl.style.backgroundColor = "#fef3c7";
@@ -561,8 +646,28 @@ HTML_CONTENT = """
         // Visual representation of baby movement intensity (0-100 scale)
         const movementScore = v.mvb ?? 0;
         const clampScore = Math.max(0, Math.min(100, movementScore));
-        document.getElementById("wiggle-thumb").style.left = clampScore + "%";
+        const wiggleThumb = document.getElementById("wiggle-thumb");
+        wiggleThumb.style.left = clampScore + "%";
+        // Color the thumb based on movement intensity
+        if (clampScore >= 50) {
+            wiggleThumb.style.backgroundColor = "#ef4444";
+        } else if (clampScore >= 25) {
+            wiggleThumb.style.backgroundColor = "#f59e0b";
+        } else {
+            wiggleThumb.style.backgroundColor = "#10b981";
+        }
         document.getElementById("mv").innerText = v.mv ?? "--";
+
+        // --- Wake Detection ---
+        if (typeof window._lastSS === 'undefined') window._lastSS = v.ss;
+        if ((window._lastSS === 8 || window._lastSS === 15) && v.ss === 1) {
+            // Baby transitioned from sleep to awake
+            const alertBannerW = document.getElementById("alertBanner");
+            const alertTextW = document.getElementById("alertText");
+            alertBannerW.className = "alert-banner show alert-info";
+            alertTextW.innerText = "👶 Baby woke up!";
+        }
+        window._lastSS = v.ss;
 
         // --- 6. TECH CARDS ---
         // Update technical diagnostic cards with color-coded status indicators
@@ -601,7 +706,10 @@ HTML_CONTENT = """
             bpText = "Docked/Charging";
             bpColor = "#8b5cf6";
         } else {
-            if (bpVal === 1) {
+            if (bpVal === 1 && motionArtifact) {
+                bpText = "Moving (1)";
+                bpColor = "#f59e0b";
+            } else if (bpVal === 1) {
                 bpText = "Calibrating (1)";
                 bpColor = "#f59e0b";
             } else if (bpVal === 6) {
@@ -611,11 +719,17 @@ HTML_CONTENT = """
                 bpText = "Idle/Docked (7)";
                 bpColor = "#8b5cf6";
             } else if (bpVal === 8) {
-                bpText = "Docked (8)";
-                bpColor = "#8b5cf6";
+                bpText = "Stabilizing (8)";
+                bpColor = "#f59e0b";
+            } else if (bpVal === 9) {
+                bpText = "Acquiring (9)";
+                bpColor = "#3b82f6";
             } else if (bpVal === 10) {
                 bpText = "Monitoring (10)";
                 bpColor = "#10b981";
+            } else if (bpVal === 11) {
+                bpText = "Settling (11)";
+                bpColor = "#3b82f6";
             } else {
                 bpText = `Code ${bpVal}`;
             }
@@ -683,7 +797,10 @@ HTML_CONTENT = """
 
         // --- 7. DEVICE INFO & ALERT HISTORY ---
         const info = payload.device_info || {};
-        const alertHistory = payload.alert_history || [];
+        const alertHistoryData = payload.alert_history || {};
+        const alertHistory = (alertHistoryData && alertHistoryData.records) ? alertHistoryData.records : (Array.isArray(alertHistoryData) ? alertHistoryData : []);
+        const alertTs = alertHistoryData ? alertHistoryData.updated_at : null;
+        const alertEpoch = alertHistoryData ? alertHistoryData.header_epoch : null;
 
         // --- Alert History Summary (on main page) ---
         const sumTotal = document.getElementById("sum-total");
@@ -747,7 +864,10 @@ HTML_CONTENT = """
 
         // Alert History table
         const alertCountEl = document.getElementById("alert-history-count");
-        alertCountEl.innerText = alertHistory.length + " events";
+        let tsInfo = "";
+        if (alertEpoch) tsInfo = " (since " + alertEpoch.substring(0, 10) + ")";
+        else if (alertTs) tsInfo = " (updated " + alertTs.substring(0, 10) + ")";
+        alertCountEl.innerText = alertHistory.length + " events" + tsInfo;
 
         // Only rebuild table if count changed
         if (window._lastAlertCount !== alertHistory.length) {

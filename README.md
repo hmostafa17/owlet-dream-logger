@@ -10,11 +10,13 @@ Available as both a **web dashboard** (FastAPI) and a **standalone desktop app**
 ## Features
 
 - **Live Vitals** — Heart rate, SpO2, skin temperature, and movement streamed every 2 seconds
-- **Device Alerts** — Real-time Owlet alerts: low oxygen, high/low HR, critical battery, sock off, sock disconnected
+- **Device State Machine** — Computed device state: Monitoring, Charging, Charged, No Signal, Disconnected — using LIR (Low Integrity Read) truth table logic
+- **Alarm Priority System** — 3-tier alarm level (HIGH / MED / LOW) from `PREVIEW_*_PRIORITY_ALARM` properties
+- **Device Alerts** — Real-time Owlet alerts: low oxygen, high/low HR, critical battery, sock off, sock disconnected, low signal (yellow light)
 - **Color-Coded Ranges** — HR and oxygen values change color based on clinical ranges
 - **Quality Badges** — LIVE, CALIBRATING, WEAK, IDLE, DOCKED status indicators based on band placement state
 - **Stale Data Detection** — Warnings when the base station loses connection
-- **Technical Diagnostics** — Battery, WiFi signal, sock placement, skin temp, charging status
+- **Technical Diagnostics** — Battery, WiFi signal, sock placement, sleep state, skin temp, charging status
 - **CSV Logging** — Every reading automatically saved to `owlet_data_log.csv`
 - **Token Auto-Refresh** — Long-running sessions stay connected without re-authentication
 - **Device Insights** — Firmware versions, MAC addresses, monitoring settings, and decoded alert history (desktop: Device Insights tab)
@@ -158,10 +160,31 @@ The `bp` field represents the sock sensor signal quality state. This field is **
 |----|-------|----------|
 | **7** | Idle / Docked | hr=0, ox=0, bso=0, chg=2. Sock sitting on fully charged base, not monitoring. |
 | **1** | Calibrating | hr=97–188 (avg 158), ox=100. Very high/erratic HR — sensor still locking on after placement. |
+| **8** | Stabilizing | hr=100–115, ox=99–100, ss=8. Intermediate re-lock state ~45 sec. Sensor adjusting after signal disruption. Always transitions 8→1→10. |
+| **9** | Acquiring | hr=109–119, ox=98–99, ss=15. Sock placed on baby, reading vitals but signal not fully optimized. Transitions from bp=7 (docked). |
 | **10** | Active Monitoring | hr=84–134, ox=99–100, bso=1. Best quality readings — sock properly placed and reading. |
+| **11** | Settling | hr=109–129, ox=97–100. Brief 2–5 sec transition when monitoring quality drops. Precedes 9 (re-acquire) or 8 (stabilize). |
 | **6** | Signal Degraded | hr=0–130, ox=0–100. Mixed readings — sometimes valid, sometimes lost. 141 of 448 rows had ox=0. |
 
-Observed state transitions: `7 → 1 → 10` (docked → calibrating → monitoring), `10 ↔ 1` (brief recalibrations during monitoring), `10 → 6 → 7` (signal loss → idle).
+Observed state transitions: `7 → 9 → 10` (docked → acquiring → monitoring), `7 → 1 → 10` (docked → calibrating → monitoring), `10 → 11 → 9 → 1 → 10` (settling → re-acquiring → recalibrating), `10 → 11 → 8 → 1 → 10` (settling → stabilizing → recalibrating), `10 ↔ 1` (brief recalibrations), `10 → 6 → 7` (signal loss → idle).
+
+### Motion Artifact Detection
+
+When the baby is moving heavily (`mvb ≥ 50%`), pulse oximetry readings become unreliable due to motion artifact. The app detects this and:
+
+- **Softens color coding** — HR/SpO2 values that would normally show red are downgraded to yellow
+- **Shows "MOVING" badge** — replaces the normal quality badge on the HR card
+- **Displays warning text** — "⚡ Motion artifact — reading may be inaccurate" on both HR and SpO2 cards
+- **Context-aware bp=1** — when bp=1 during high movement, shows "Moving (1)" instead of "Calibrating (1)"
+
+Real-world example: HR at 190 BPM with mvb=83% and SpO2 dipping to 92% — both are motion artifacts, not true cardiac events.
+
+### Wake Detection
+
+The app monitors sleep state (`ss`) transitions and alerts when the baby wakes up:
+- Triggers when `ss` changes from **8** (Light Sleep) or **15** (Deep Sleep) to **1** (Awake)
+- Displays a "👶 Baby woke up!" alert banner
+- Correlates with movement spikes (`mvb` and `mv` increases)
 
 ### Monitoring State
 
@@ -186,6 +209,50 @@ Observed state transitions: `7 → 1 → 10` (docked → calibrating → monitor
 | Key | Name | Type | Description |
 |-----|------|------|-------------|
 | `hw` | Hardware Version | str | Hardware revision identifier (e.g. `"obs4"` = Owlet Base Station revision 4). |
+
+### Separate Ayla Properties (outside REAL_TIME_VITALS)
+
+These properties are individual Ayla datapoints (not inside the REAL_TIME_VITALS JSON):
+
+| Property | Description |
+|----------|-------------|
+| `LOW_INTEG_READ` | **Low Integrity Read** — the Owlet "yellow light." Sock is connected but sensor cannot get a valid reading. |
+| `PREVIEW_HIGH_PRIORITY_ALARM` | **High priority alarm** active (critical oxygen, critical HR). |
+| `PREVIEW_MED_PRIORITY_ALARM` | **Medium priority alarm** active (out-of-range vitals). |
+| `PREVIEW_LOW_PRIORITY_ALARM` | **Low priority alarm** active (low battery, placement issue). |
+| `LOW_OX_ALRT`, `CRIT_OX_ALRT` | Low / critical oxygen saturation alert. |
+| `LOW_HR_ALRT`, `HIGH_HR_ALRT` | Low / high heart rate alert. |
+| `LOW_BATT_ALRT`, `CRIT_BATT_ALRT` | Low / critical battery alert. |
+| `SOCK_OFF`, `SOCK_DISCON_ALRT` | Sock removed or disconnected from base. |
+| `LOST_POWER_ALRT` | Base station lost power. |
+| `DISCOMFORT_ALRT` | Baby discomfort detected. |
+| `RED_ALERT_SUMMARY` | Base64-encoded alert history (decoded in Device Insights). |
+
+### Device State Machine (LIR Logic)
+
+The app computes a high-level device state using the **LIR (Low Integrity Read) truth table** from [jlamendo/ha-sensor.owlet](https://github.com/jlamendo/ha-sensor.owlet):
+
+```
+LIR = LOW_INTEG_READ OR (HR=0 AND SpO2=0 AND no HR/OX alerts)
+```
+
+| State | Condition | Meaning |
+|-------|-----------|---------|
+| **Monitoring** | LIR=false | Good readings — sock properly placed, vitals streaming |
+| **No Signal** | LIR=true, not charging | Yellow light — sock on but no sensor contact |
+| **Charging** | LIR=true, chg=1 | Sock charging on base station |
+| **Charged** | LIR=true, chg=2 | Sock fully charged, sitting on base |
+| **Disconnected** | bso≠1 AND LIR=true | Base station off and no readings |
+
+### Alarm Priority System
+
+Three-tier alarm system from `PREVIEW_*_PRIORITY_ALARM` properties:
+
+| Priority | Badge | Typical Triggers |
+|----------|-------|-----------------|
+| **HIGH** | 🔴 ⚠ HIGH | Critical oxygen, critical heart rate |
+| **MED** | 🟡 ⚠ MED | Out-of-range vitals, discomfort |
+| **LOW** | 🔵 ⚠ LOW | Low battery, placement issues |
 
 ## Building a Standalone .exe
 
