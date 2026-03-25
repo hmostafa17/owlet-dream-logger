@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build / Distribution
+dist/
+build/
+*.spec
+*.exe
+*.backup
+
+# Logs and data
+*.log
+owlet_data_log.csv
+debug_logs/
+
+# OS files
+.DS_Store
+Thumbs.db
