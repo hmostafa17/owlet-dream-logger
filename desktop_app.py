@@ -302,8 +302,8 @@ class DashboardFrame(ctk.CTkFrame):
 
         self.tech_cards = {}
         tech_items = [
-            ("onm", "Monitoring"), ("bp", "Placement"), ("mrs", "Recovery"),
-            ("bso", "Base Station"), ("mvb", "Base Mvmt"), ("ss", "Sock Signal"),
+            ("onm", "Monitoring"), ("bp", "Band Placement"), ("mrs", "Monitor Ready"),
+            ("bso", "Base Station"), ("mvb", "Movement %"), ("ss", "Sleep State"),
             ("rsi", "WiFi Signal"), ("sc", "Sock Conn"), ("chg", "Charging"),
             ("bat", "Battery"), ("st", "Skin Temp"), ("sock_off", "Sock Off"),
         ]
@@ -509,23 +509,20 @@ class DashboardFrame(ctk.CTkFrame):
         self.hr_card.set_value(current_hr, hr_color)
         self.hr_card.set_sub("● 100-160 Normal  ● 90-99 Alert  ● <90/>180 Critical")
 
-        # Quality badge on HR card
+        # Quality badge on HR card based on band placement state
         bp = v.get("bp")
         is_charging = v.get("chg") == 1
-        show_stale_warning = (bp == 2 and self._hr_stale_count > 5 and not is_charging)
 
         if is_charging:
             self.hr_card.set_badge("DOCKED", "#ede9fe", "#5b21b6")
-        elif show_stale_warning:
-            self.hr_card.set_badge("FROZEN", "#fee2e2", "#991b1b")
-        elif bp == 1:
+        elif bp == 10:
             self.hr_card.set_badge("LIVE", "#d1fae5", "#065f46")
-        elif bp == 2:
-            self.hr_card.set_badge("WEAK", "#cffafe", "#155e75")
-        elif bp == 4:
-            self.hr_card.set_badge("MOVING", "#dbeafe", "#1e40af")
-        elif bp in (6, 7):
-            self.hr_card.set_badge("NOISE", "#fee2e2", "#991b1b")
+        elif bp == 1:
+            self.hr_card.set_badge("CALIBRATING", "#fef3c7", "#92400e")
+        elif bp == 6:
+            self.hr_card.set_badge("WEAK", "#fee2e2", "#991b1b")
+        elif bp == 7:
+            self.hr_card.set_badge("IDLE", "#ede9fe", "#5b21b6")
         else:
             self.hr_card.set_badge("", COLORS["border"], COLORS["text"])
 
@@ -581,22 +578,18 @@ class DashboardFrame(ctk.CTkFrame):
             self.tech_cards["onm"].set_value(f"Status {onm}", COLORS["text"])
 
         mrs = v.get("mrs")
-        self.tech_cards["mrs"].set_value("ON" if mrs == 1 else "OFF",
-                                         COLORS["yellow"] if mrs == 1 else COLORS["text"])
+        self.tech_cards["mrs"].set_value("READY" if mrs == 1 else "NOT READY",
+                                         COLORS["green"] if mrs == 1 else COLORS["yellow"])
 
         bp_text, bp_color = f"Code {bp}", COLORS["text"]
         if is_charging:
             bp_text, bp_color = "Docked/Charging", COLORS["purple"]
         elif bp == 1:
-            bp_text, bp_color = "Signal Good (1)", COLORS["green"]
-        elif bp == 2:
-            bp_text, bp_color = "Loose Fit (2)", "#06b6d4"
-        elif bp == 4:
-            bp_text, bp_color = "Acquiring (4)", COLORS["blue"]
+            bp_text, bp_color = "Calibrating (1)", COLORS["yellow"]
         elif bp == 6:
-            bp_text, bp_color = "Dislodged (6)", COLORS["red"]
+            bp_text, bp_color = "Degraded (6)", COLORS["red"]
         elif bp == 7:
-            bp_text, bp_color = "Error (7)", COLORS["yellow"]
+            bp_text, bp_color = "Idle/Docked (7)", COLORS["purple"]
         elif bp == 8:
             bp_text, bp_color = "Docked (8)", COLORS["purple"]
         elif bp == 10:
@@ -607,9 +600,13 @@ class DashboardFrame(ctk.CTkFrame):
         self.tech_cards["bso"].set_value("POWER ON" if bso == 1 else "OFF",
                                          COLORS["green"] if bso == 1 else COLORS["red"])
 
-        self.tech_cards["mvb"].set_value(v.get("mvb", "-"))
+        mvb = v.get("mvb")
+        self.tech_cards["mvb"].set_value(f"{mvb}%" if mvb is not None else "-")
         ss = v.get("ss")
-        self.tech_cards["ss"].set_value(f"📶 {ss}" if ss else "-")
+        ss_labels = {0: "Inactive", 1: "Awake", 8: "Light Sleep", 15: "Deep Sleep"}
+        ss_colors = {0: COLORS["text_sub"], 1: COLORS["yellow"], 8: COLORS["blue"], 15: COLORS["green"]}
+        self.tech_cards["ss"].set_value(ss_labels.get(ss, f"State {ss}") if ss is not None else "-",
+                                        ss_colors.get(ss, COLORS["text"]))
         rsi = v.get("rsi")
         self.tech_cards["rsi"].set_value(f"{rsi}%" if rsi else "-")
         sc = v.get("sc")

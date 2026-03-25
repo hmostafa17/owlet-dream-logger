@@ -282,11 +282,11 @@ HTML_CONTENT = """
                 <div class="tech-val" id="onm">--</div>
             </div>
             <div class="tech-card">
-                <div class="card-label">Placement Status</div>
+                <div class="card-label">Band Placement</div>
                 <div class="tech-val" id="bp">--</div>
             </div>
             <div class="tech-card">
-                <div class="card-label">Recovery Mode</div>
+                <div class="card-label">Monitor Ready</div>
                 <div class="tech-val" id="mrs">--</div>
             </div>
             <div class="tech-card">
@@ -294,11 +294,11 @@ HTML_CONTENT = """
                 <div class="tech-val" id="bso">--</div>
             </div>
             <div class="tech-card">
-                <div class="card-label">Base Mvmt</div>
+                <div class="card-label">Movement %</div>
                 <div class="tech-val" id="mvb">--</div>
             </div>
             <div class="tech-card">
-                <div class="card-label">Sock Signal</div>
+                <div class="card-label">Sleep State</div>
                 <div class="tech-val" id="ss">--</div>
             </div>
             <div class="tech-card">
@@ -510,8 +510,8 @@ HTML_CONTENT = """
         const isCharging = (v.chg === 1);
         let showStaleWarning = false;
 
-        // If BP is 2 (Weak) AND HR has been identical for >10 sec (5 updates)
-        if (bp === 2 && window.hrStaleCount > 5 && !isCharging) {
+        // If BP is 6 (Degraded) AND HR has been identical for >10 sec (5 updates)
+        if (bp === 6 && window.hrStaleCount > 5 && !isCharging) {
             showStaleWarning = true;
         }
 
@@ -526,22 +526,22 @@ HTML_CONTENT = """
             qualEl.innerText = "FROZEN"; 
             qualEl.style.backgroundColor = "#fee2e2"; 
             qualEl.style.color = "#991b1b";
-        } else if (bp === 1) {
+        } else if (bp === 10) {
             qualEl.innerText = "LIVE";
             qualEl.style.backgroundColor = "#d1fae5";
             qualEl.style.color = "#065f46";
-        } else if (bp === 2) {
+        } else if (bp === 1) {
+            qualEl.innerText = "CALIBRATING";
+            qualEl.style.backgroundColor = "#fef3c7";
+            qualEl.style.color = "#92400e";
+        } else if (bp === 6) {
             qualEl.innerText = "WEAK";
-            qualEl.style.backgroundColor = "#cffafe";
-            qualEl.style.color = "#155e75";
-        } else if (bp === 4) {
-            qualEl.innerText = "MOVING";
-            qualEl.style.backgroundColor = "#dbeafe";
-            qualEl.style.color = "#1e40af";
-        } else if (bp === 6 || bp === 7) {
-            qualEl.innerText = "NOISE";
             qualEl.style.backgroundColor = "#fee2e2";
             qualEl.style.color = "#991b1b";
+        } else if (bp === 7) {
+            qualEl.innerText = "IDLE";
+            qualEl.style.backgroundColor = "#ede9fe";
+            qualEl.style.color = "#5b21b6";
         } else {
             qualEl.style.display = "none";
         }
@@ -580,17 +580,17 @@ HTML_CONTENT = """
             onmEl.style.color = "#374151";
         }
 
-        // Recovery Mode (mrs) - Indicates if sock is in recovery/reconnection mode
+        // Monitor Ready Status (mrs) - Indicates monitoring subsystem initialized
         const mrsEl = document.getElementById("mrs");
         if (v.mrs === 1) {
-            mrsEl.innerText = "ON";
-            mrsEl.style.color = "#f59e0b";
+            mrsEl.innerText = "READY";
+            mrsEl.style.color = "#10b981";
         } else {
-            mrsEl.innerText = "OFF";
-            mrsEl.style.color = "#374151";
+            mrsEl.innerText = "NOT READY";
+            mrsEl.style.color = "#f59e0b";
         }
 
-        // Placement (bp) - Shows sock placement quality and fit status
+        // Band Placement (bp) - Shows sock sensor signal quality state
         // REVISED LOGIC WITH CHARGING CHECK
         const bpEl = document.getElementById("bp");
         const bpVal = v.bp;
@@ -598,26 +598,18 @@ HTML_CONTENT = """
         let bpColor = "#374151";
 
         if (isCharging) {
-            // Charging overrides everything else
             bpText = "Docked/Charging";
-            bpColor = "#8b5cf6"; // Purple
+            bpColor = "#8b5cf6";
         } else {
-            // Normal BP Logic
             if (bpVal === 1) {
-                bpText = "Signal Good (1)";
-                bpColor = "#10b981";
-            } else if (bpVal === 2) {
-                bpText = "Loose Fit (2)";
-                bpColor = "#06b6d4"; 
-            } else if (bpVal === 4) {
-                bpText = "Acquiring (4)";
-                bpColor = "#3b82f6";
+                bpText = "Calibrating (1)";
+                bpColor = "#f59e0b";
             } else if (bpVal === 6) {
-                bpText = "Dislodged (6)";
+                bpText = "Degraded (6)";
                 bpColor = "#ef4444";
             } else if (bpVal === 7) {
-                bpText = "Placement Error (7)";
-                bpColor = "#f59e0b";
+                bpText = "Idle/Docked (7)";
+                bpColor = "#8b5cf6";
             } else if (bpVal === 8) {
                 bpText = "Docked (8)";
                 bpColor = "#8b5cf6";
@@ -643,8 +635,12 @@ HTML_CONTENT = """
         }
 
         // Update remaining technical diagnostic values
-        document.getElementById("mvb").innerText = v.mvb ?? "-";
-        document.getElementById("ss").innerText = v.ss ? "📶 " + v.ss : "-";
+        document.getElementById("mvb").innerText = v.mvb != null ? v.mvb + "%" : "-";
+        const ssLabels = {0: "Inactive", 1: "Awake", 8: "Light Sleep", 15: "Deep Sleep"};
+        const ssColors = {0: "#9ca3af", 1: "#f59e0b", 8: "#3b82f6", 15: "#10b981"};
+        const ssEl = document.getElementById("ss");
+        ssEl.innerText = v.ss != null ? (ssLabels[v.ss] || "State " + v.ss) : "-";
+        ssEl.style.color = ssColors[v.ss] || "#374151";
         document.getElementById("rsi").innerText = v.rsi ? v.rsi + "%" : "-";
         
         const scEl = document.getElementById("sc");

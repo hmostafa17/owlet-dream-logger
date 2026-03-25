@@ -156,24 +156,24 @@ def process_properties(raw_props, alerts=None):
             # Extract all vital sign measurements into a structured dictionary
             vitals = {
                 "hr": d.get("hr"),      # Heart rate in BPM
-                "ox": d.get("ox"),      # Oxygen saturation percentage
-                "oxta": d.get("oxta"),  # Time-averaged oxygen saturation
-                "mv": d.get("mv"),      # Movement value (raw intensity)
-                "mvb": d.get("mvb"),    # Movement baseline (0-100 scale)
+                "ox": d.get("ox"),      # Oxygen saturation percentage (SpO2)
+                "oxta": d.get("oxta"),  # 10-second rolling average SpO2 (255 = no data)
+                "mv": d.get("mv"),      # Raw accelerometer movement intensity (0-146+)
+                "mvb": d.get("mvb"),    # Movement bucket - normalized 0-100% scale
                 "bat": d.get("bat"),    # Battery percentage
-                "btt": d.get("btt"),    # Battery time remaining
-                "chg": d.get("chg"),    # Charging status (1=charging, 0=not charging)
-                "rsi": d.get("rsi"),    # WiFi signal strength (RSSI)
-                "ss": d.get("ss"),      # Sock signal strength
-                "sc": d.get("sc"),      # Sock connection status
-                "bp": d.get("bp"),      # Base placement/fit quality code
-                "hw": d.get("hw"),      # Hardware version
-                "bsb": d.get("bsb"),    # Base station battery
-                "onm": d.get("onm"),    # Monitoring status (3=active, 0=paused)
-                "bso": d.get("bso"),    # Base station on/off status
-                "mrs": d.get("mrs"),    # Recovery mode status
+                "btt": d.get("btt"),    # Battery time remaining in minutes
+                "chg": d.get("chg"),    # Charging status (0=none, 1=charging, 2=charged)
+                "rsi": d.get("rsi"),    # WiFi/BLE signal strength indicator
+                "ss": d.get("ss"),      # Sleep state (0=inactive, 1=awake, 8=light, 15=deep)
+                "sc": d.get("sc"),      # Sock-to-base connection (2=connected)
+                "bp": d.get("bp"),      # Band placement state (7=idle, 1=calibrating, 10=monitoring, 6=degraded)
+                "hw": d.get("hw"),      # Hardware version (e.g. "obs4")
+                "bsb": d.get("bsb"),    # Base station battery backup status
+                "onm": d.get("onm"),    # Wellness alert / monitoring mode (3=active)
+                "bso": d.get("bso"),    # Base station on (1=on, 0=off)
+                "mrs": d.get("mrs"),    # Monitoring ready status (1=ready)
                 "st": d.get("st"),      # Skin temperature
-                "srf": d.get("srf"),    # Readings flag (data validity)
+                "srf": d.get("srf"),    # Sensor readings flag (1=valid readings available)
             }
 
     # Extract alert flags from raw properties (boolean alerts from API)
