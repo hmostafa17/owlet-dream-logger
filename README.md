@@ -15,16 +15,22 @@ Available as both a **web dashboard** (FastAPI) and a **standalone desktop app**
 - **Device Alerts** — Real-time Owlet alerts: low oxygen, high/low HR, critical battery, sock off, sock disconnected, low signal (yellow light)
 - **Color-Coded Ranges** — HR and oxygen values change color based on clinical ranges
 - **Quality Badges** — LIVE, CALIBRATING, WEAK, IDLE, DOCKED status indicators based on band placement state
-- **Stale Data Detection** — Warnings when the base station loses connection, with automatic multi-stage recovery
+- **Multi-Stage Stall Recovery** — Automatic recovery when the base station loses connection: re-auth, connection nuke, session rebuild, device kick, with exponential backoff
+- **Frozen Stream Detection** — Detects when HR+O2 values stop changing (even if timestamps look fresh) and forces hard recovery after 90 seconds
+- **Null Vitals Detection** — Catches `hr=None`/`o2=None` responses with stronger recovery penalty
+- **Parallel Polling** — Fetches data via both `sock.update_properties()` and raw Ayla API `GET` simultaneously for fastest response
+- **Adaptive Keepalive** — `APP_ACTIVE` heartbeat interval drops from 15s to 10s during degradation
+- **Exponential Backoff** — Recovery retries back off (2s → 4s → 8s → ... → 60s cap), reset on success
+- **Device Kick Sequence** — Mimics official Owlet app reconnect: `update_properties → APP_ACTIVE → update_properties`
 - **Motion Artifact Detection** — Flags unreliable readings during high baby movement (mvb ≥ 50%)
 - **Wake Detection** — Alerts when sleep state transitions from sleep to awake
-- **Sleep Session Tracking** — Tracks total session time with per-state breakdown (Deep, Light, Awake). Brief awakenings don't reset the session — only docking the sock ends it. On startup, queries Ayla datapoint history to recover in-progress sessions.
+- **Sleep Session Tracking** — Tracks total session time with per-state breakdown (Deep, Light, Awake). Brief awakenings don't reset the session — only docking the sock ends it. On startup, queries Ayla datapoint history (2000 datapoints) to recover in-progress sessions.
 - **Technical Diagnostics** — Battery, WiFi signal, sock placement, sleep state, skin temp, charging status
 - **CSV Logging** — Every reading automatically saved to `owlet_data_log.csv`
 - **Token Auto-Refresh** — Long-running sessions stay connected without re-authentication
-- **Device Insights** — Firmware versions, MAC addresses, monitoring settings, and decoded alert history (desktop: Device Insights tab)
+- **Device Insights** — Firmware versions, MAC addresses, monitoring settings, and decoded alert history
 - **Alert History Summary** — Decoded RED_ALERT_SUMMARY showing HR, SpO2, duration, and type for every alert event
-- **Two Interfaces** — Web dashboard for multi-device access, desktop app for simplicity
+- **Two Interfaces** — Web dashboard for multi-device access, desktop app for simplicity — both share the same layout and monitoring logic
 
 ## Quick Start
 
@@ -55,19 +61,36 @@ python desktop_app.py
 owlet/
 ├── main.py                 # FastAPI web server entry point
 ├── desktop_app.py          # Standalone desktop GUI (CustomTkinter)
-├── launcher.py             # Launcher for .exe builds (PyInstaller)
-├── config.py               # Application settings
-├── worker.py               # Background Owlet API polling loop
+├── owlet_monitor.py        # Core monitoring loop (shared async generator)
+├── worker.py               # Recovery helpers + thin WebSocket wrapper
 ├── owlet_service.py        # Device discovery
-├── data_processing.py      # Raw data → structured vitals
+├── data_processing.py      # Raw data → structured vitals + sleep tracking
 ├── csv_logger.py           # CSV file logging
+├── config.py               # Application settings
 ├── session.py              # In-memory session store (web mode)
 ├── dashboard.py            # Web dashboard HTML/CSS/JS
 ├── login_page.py           # Web login page HTML/CSS/JS
 ├── debug_api.py            # API debug tool (downloads logs, decodes alerts)
+├── launcher.py             # Launcher for .exe builds (PyInstaller)
 ├── Start_Owlet_Logger.bat  # Windows batch launcher
 ├── requirements.txt        # Python dependencies
 └── BUILDING.md             # Instructions for creating .exe
+```
+
+### Architecture
+
+Both the web and desktop apps consume from `owlet_monitor.py`, which provides a single `owlet_data_stream()` async generator containing all shared logic: authentication, device discovery, parallel polling, sleep session recovery, multi-stage stall recovery, frozen stream detection, adaptive keepalive, and CSV logging.
+
+```
+                    ┌─ main.py (FastAPI) ──── WebSocket ──── dashboard.py
+                    │
+owlet_monitor.py ───┤
+                    │
+                    └─ desktop_app.py (CustomTkinter GUI)
+                    │
+                    └─ worker.py (recovery helpers: _force_activate,
+                       _nuke_connection, _rebuild_session, _parallel_fetch,
+                       _patch_activate)
 ```
 
 ## Configuration
@@ -279,19 +302,161 @@ Three-tier alarm system from `PREVIEW_*_PRIORITY_ALARM` properties:
 
 ## Stall Recovery System
 
-The Owlet base station requires a periodic `APP_ACTIVE=1` heartbeat via the Ayla cloud API to keep pushing `REAL_TIME_VITALS`. If this heartbeat is missed (due to token expiry, an API hiccup, or a pyowletapi bug where `activate()` calls `self.authenticate()` without `await`), the base station stops updating vitals while continuing to process alerts locally (which is why you still get phone notifications during a stall).
+> **This section is written as a reference for building resilient IoT polling clients.** The patterns here apply to any cloud-connected device where the API can appear healthy while the actual data stream is dead.
 
-The worker implements a multi-stage automatic recovery:
+### The Root Problem
 
-| Stage | Trigger | Action | Effect |
-|-------|---------|--------|--------|
-| **Proactive** | Every 25s | Explicit `APP_ACTIVE=1` POST with fresh token | Prevents most stalls from occurring |
-| **0 — Normal** | lag < 30s | Standard polling | Green status |
-| **1 — Re-auth** | 5 consecutive stale cycles | Force token refresh + explicit `APP_ACTIVE` | Fixes token expiry stalls (~80% of cases) |
-| **2 — Rebuild** | 15 consecutive stale cycles | Tear down and recreate entire API session | Fixes stuck sessions, routing issues |
-| **Backoff** | During stage 2 | Polling slowed to 5s | Avoids rate-limiting during recovery |
+The Owlet base station communicates with the Ayla IoT cloud platform over a persistent TCP connection. To receive live vitals (`REAL_TIME_VITALS`), the client must periodically POST `APP_ACTIVE=1` as a heartbeat — this tells the cloud "someone is watching, keep the push channel open." Without it, the base station stops sending vitals within ~36 seconds.
 
-Additionally, all `update_properties()` calls have a 15-second timeout to prevent the worker from hanging on a stuck API connection.
+This creates **five distinct failure modes**, each requiring a different recovery strategy:
+
+### Failure Mode Analysis
+
+| # | Failure | Root Cause | Symptom | Detection |
+|---|---------|-----------|---------|-----------|
+| 1 | **Token expiry** | OAuth token expires mid-session; pyowletapi's `activate()` calls `self.authenticate()` without `await`, silently failing | `APP_ACTIVE` POST returns 401, heartbeat stops, data goes stale after ~36s | Timestamp lag > 30s |
+| 2 | **Push channel drop** | Base station's TCP connection to Ayla cloud drops (WiFi glitch, cloud maintenance). API accepts our POSTs but base station never receives them | API calls succeed (200 OK) but vitals stop updating. Lag grows indefinitely | Timestamp lag > 30s, persists through Stage 1 |
+| 3 | **Frozen stream** | Cloud returns cached/stale data with updated timestamps. API looks healthy, responses look fresh, but HR and O2 never change | Lag stays < 30s (timestamps are fresh!), but vitals are identical for minutes | Vitals comparison: same HR+O2 for > 90s |
+| 4 | **Null vitals** | Device in error state, sensor disconnected, or API returning malformed data | `hr=None` or `o2=None` in response | Null check on core fields |
+| 5 | **Network partition** | Client loses internet, API calls time out or throw connection errors | `asyncio.TimeoutError` or `aiohttp.ClientError` exceptions | Exception handling on fetch |
+
+**Key insight:** Failure modes 1 and 2 look identical from the API side — you can't distinguish "my heartbeat isn't reaching the cloud" from "my heartbeat reaches the cloud but the cloud can't reach the base station." You have to try fixing both and see which works.
+
+**Key insight:** Failure mode 3 is the hardest to catch. Traditional staleness detection (comparing timestamps) completely misses it. You must compare the actual vitals values between consecutive reads.
+
+### Detection Architecture
+
+The system uses **dual detection** — both timestamp-based and value-based — to catch all failure modes:
+
+```
+Every 2s poll cycle:
+  │
+  ├─ Null check: hr=None or o2=None?
+  │   └─ YES → stale_count += 2 (stronger penalty)
+  │
+  ├─ Vitals comparison: same HR+O2 as last read?
+  │   └─ YES for > 90s → jump straight to Stage 2
+  │
+  ├─ Timestamp lag: data_updated_at older than 30s?
+  │   └─ YES → stale_count += 1
+  │
+  └─ All clear → reset all counters, reset backoff
+```
+
+**Why dual detection matters:** In testing, we observed periods where the Ayla API returned responses with fresh `data_updated_at` timestamps but the `REAL_TIME_VITALS` JSON inside hadn't changed for 3+ minutes. A baby's heart rate and SpO2 naturally fluctuate by 1-5 BPM/% every few seconds — if both are frozen for 90 seconds, the stream is dead.
+
+### Recovery Pipeline
+
+Recovery is staged from least-disruptive to most-aggressive. Each stage only triggers if the previous stage failed to restore fresh data:
+
+```
+Normal Polling (2s)
+  │
+  │ lag > 30s (1 stale cycle)
+  ▼
+STAGE 1: Soft Recovery
+  ├─ Force token expiry (api._expiry = 0)
+  ├─ Re-authenticate (new OAuth token)
+  ├─ APP_ACTIVE toggle: POST 0 → wait 1s → POST 1
+  ├─ BASE_STATION_ON_CMD: POST {"ts": now, "val": "true"}
+  └─ Reset keepalive timer
+  │
+  │ Still stale after 5 cycles (~10s)
+  │ OR vitals frozen for 90s
+  ▼
+STAGE 2: Hard Recovery (Connection Nuke + Session Rebuild)
+  │
+  ├─ Part A: Cloud-Level Commands
+  │   ├─ 1. Destroy local TCP connection pool (aiohttp connector.close())
+  │   ├─ 2. Create fresh aiohttp session (force_close=True, no keep-alive)
+  │   ├─ 3. Force re-authenticate (new TLS handshake)
+  │   ├─ 4. BASE_STATION_ON_CMD → OFF
+  │   ├─ 5. LOW_POWER_MODE_CMD → 1 (drops base station's TCP to cloud)
+  │   ├─ 6. Wait 10 seconds (base tears down cloud connection)
+  │   ├─ 7. LOW_POWER_MODE_CMD → 0
+  │   ├─ 8. BASE_STATION_ON_CMD → ON (forces cloud reconnect)
+  │   ├─ 9. APP_ACTIVE toggle (0 → 1)
+  │   └─ 10. DEVICE_PING (nudge cloud to re-establish push channel)
+  │
+  ├─ Part B: Full Session Rebuild
+  │   ├─ Close old API session entirely
+  │   ├─ Create new OwletAPI instance + authenticate
+  │   ├─ Re-discover device (new Sock object)
+  │   └─ Device kick sequence (mimics official Owlet app):
+  │       update_properties → 2s → APP_ACTIVE → 2s → update_properties
+  │
+  │ Still stale after 8 more cycles
+  ▼
+RETRY: Exponential Backoff Loop
+  ├─ Wait backoff seconds (starts at 2s, doubles each retry, caps at 60s)
+  ├─ Full nuke + rebuild (same as Stage 2)
+  ├─ Full state reset: stale_count=0, recovery_stage=0,
+  │   fresh_start_time=None, last_data=None, last_real_change_time=now
+  └─ Repeat until fresh data arrives or manual intervention
+```
+
+### Proactive Systems (Stall Prevention)
+
+Rather than just reacting to stalls, the system actively works to prevent them:
+
+| System | Interval | Action | Why It Helps |
+|--------|----------|--------|--------------|
+| **Keepalive heartbeat** | Every 15s (10s during recovery) | POST `APP_ACTIVE=1` with fresh token check | Keeps the Ayla push channel open; the base station times out after ~36s without it |
+| **Proactive refresh** | After 15s of continuous fresh data | `APP_ACTIVE` toggle (0→1) | Re-establishes the push channel before it degrades; based on observation that the base station's ~40s firmware streaming window benefits from periodic heartbeat refreshes |
+| **Parallel polling** | Every poll cycle | `sock.update_properties()` AND raw `GET /dsns/{serial}/properties.json` simultaneously | Two independent paths to the same data; whichever returns fresher `data_updated_at` wins. Catches cases where pyowletapi's internal cache is stale but the raw API has fresh data |
+| **Activate throttle** | Max 1 per 5s | Monkey-patched `get_properties()` throttles internal `activate()` calls | Original pyowletapi calls `activate()` on every `get_properties()` (30/min at 2s polling). This overwhelmed the Ayla cloud. Throttling to 12/min keeps the channel alive without rate limiting |
+
+### State Variables
+
+The monitoring loop maintains these variables to track health:
+
+```python
+stale_count = 0              # consecutive stale poll cycles
+recovery_stage = 0           # 0=normal, 1=soft recovery attempted, 2=hard recovery attempted
+last_keepalive = time.time() # last APP_ACTIVE heartbeat sent
+fresh_start_time = None      # when continuous fresh data started (for proactive refresh timer)
+last_data = None             # previous data dict (for vitals comparison)
+last_real_change_time = now  # wall-clock of last actual HR+O2 change
+backoff = UPDATE_INTERVAL    # exponential backoff delay (resets on fresh data)
+```
+
+**Critical design rule:** After every recovery attempt, **all state must be fully reset**. If you only reset `stale_count` but not `last_data` or `last_real_change_time`, the frozen stream detector will immediately re-trigger recovery, creating an infinite loop. We learned this the hard way.
+
+### pyowletapi Bug Workarounds
+
+The third-party `pyowletapi` library has two bugs that are fixed via monkey-patching at import time:
+
+1. **Missing `await` on re-authentication:** `activate()` calls `self.authenticate()` when the token expires, but without `await`. The coroutine is created and immediately discarded — authentication silently fails, and all subsequent API calls use an expired token. Fix: replace `activate()` with an async version that properly awaits.
+
+2. **`activate()` called on every `get_properties()`:** The original code calls `activate()` on every poll (every 2s = 30 calls/min). This overwhelms the Ayla cloud API and can trigger rate limiting. But removing `activate()` entirely causes the base station to drop its push channel after ~36 seconds. Fix: throttle to once every 5 seconds (~12/min).
+
+```python
+# Both fixes applied at import time via _patch_activate() in worker.py
+OwletAPI.activate = _fixed_activate          # Fix 1: proper await
+OwletAPI.get_properties = _throttled_version # Fix 2: max 1 activate per 5s
+```
+
+### Design Lessons Learned
+
+These patterns apply to any IoT cloud polling architecture:
+
+1. **Timestamp staleness alone is not enough.** Cloud APIs can return fresh timestamps with stale data. Always compare the actual payload values between consecutive reads.
+
+2. **Recovery must be staged.** Don't jump to "nuke everything" on the first sign of trouble — it's slow and disruptive. Try the cheapest fix first (token refresh), then escalate.
+
+3. **Full state reset after recovery.** If you reset `stale_count` but forget `last_data`, the frozen stream detector sees old vitals and immediately re-triggers recovery. Reset everything.
+
+4. **Exponential backoff is essential for retries.** Without it, a persistent failure causes 30 API calls/minute of recovery attempts. With backoff (2s → 4s → 8s → ... → 60s cap), you avoid rate limiting while still retrying.
+
+5. **Cloud-level commands can force device reconnection.** Toggling `BASE_STATION_ON_CMD` off/on and cycling `LOW_POWER_MODE_CMD` forces the base station to tear down and re-establish its TCP connection to the cloud. Combined with a fresh client-side session, this resolves most stuck push channels.
+
+6. **Monkey-patch third-party bugs.** When a library has a bug that causes silent failures (like a missing `await`), fix it at runtime rather than forking the library. Document it clearly and check on library updates.
+
+7. **Proactive refresh prevents more stalls than reactive recovery fixes.** Sending periodic keepalives and resetting connections while data is still fresh catches problems before they become visible to the user.
+
+8. **Parallel fetch paths increase reliability.** The same data available through two different API paths (pyowletapi's subscription layer vs. raw REST GET) means one path failing doesn't cause a stall. Compare timestamps to use whichever is fresher.
+
+9. **The official app is your best documentation.** The "device kick sequence" (update → wait → activate → wait → update) was discovered by watching what the official Owlet mobile app does on reconnect. When there's no API documentation, traffic analysis of the first-party app reveals the expected protocol.
 
 ## Building a Standalone .exe
 

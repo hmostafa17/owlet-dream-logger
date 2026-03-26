@@ -319,7 +319,7 @@ HTML_CONTENT = """
                 <div class="card-label">Sleep Session</div>
                 <div class="tech-val" id="ss">--</div>
                 <div id="sleep-breakdown" style="display:none; margin-top:8px; font-size:0.82rem; color:#6b7280; line-height:1.6;">
-                    <div>Total session: <span id="sleep-total" style="font-weight:600; color:#374151;">--</span></div>
+                    <div>Total session: <span id="sleep-total" style="font-weight:600; color:#374151;">--</span> <span id="sleep-since" style="font-size:0.78rem; color:#9ca3af;"></span></div>
                     <div style="display:flex; gap:12px; margin-top:2px;">
                         <span>🌙 Deep: <b id="sleep-deep">--</b></span>
                         <span>💤 Light: <b id="sleep-light">--</b></span>
@@ -775,6 +775,11 @@ HTML_CONTENT = """
             }
             ssText += " — " + fmtDur(sess.total_sleep_seconds) + " asleep";
             document.getElementById("sleep-total").innerText = fmtDur(sess.total_session_seconds);
+            const sinceEl = document.getElementById("sleep-since");
+            if (sess.start_time) {
+                const st = new Date(sess.start_time);
+                sinceEl.innerText = "(since " + st.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) + ")";
+            } else { sinceEl.innerText = ""; }
             document.getElementById("sleep-deep").innerText = fmtDur(sess.deep_seconds);
             document.getElementById("sleep-light").innerText = fmtDur(sess.light_seconds);
             document.getElementById("sleep-awake").innerText = fmtDur(sess.awake_seconds);

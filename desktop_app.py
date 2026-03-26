@@ -9,21 +9,27 @@ Usage:
 """
 
 import asyncio
-import json
 import logging
+import logging.handlers
+import time
 import threading
 from datetime import datetime
 import customtkinter as ctk
 
-from pyowletapi.api import OwletAPI
-from pyowletapi.sock import Sock
+from owlet_monitor import owlet_data_stream
 
-from config import UPDATE_INTERVAL, LOG_FILE
-from owlet_service import discover_socks
-from data_processing import process_properties, find_sleep_start, set_sleep_start
-from csv_logger import init_csv_logging, log_data_to_csv
-
-logging.basicConfig(level=logging.INFO)
+# --- Logging: console + rotating file ---
+_log_fmt = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logging.basicConfig(level=logging.DEBUG, format=_log_fmt._fmt, datefmt=_log_fmt.datefmt)
+_file_handler = logging.handlers.RotatingFileHandler(
+    "owlet_desktop_debug.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+)
+_file_handler.setLevel(logging.DEBUG)
+_file_handler.setFormatter(_log_fmt)
+logging.getLogger().addHandler(_file_handler)
 logger = logging.getLogger("owlet_desktop")
 
 ctk.set_appearance_mode("light")
@@ -187,8 +193,17 @@ class SleepPanel(ctk.CTkFrame):
 
         if sess.get("active"):
             state_text += f" \u2014 {_fmt(sess.get('total_sleep_seconds', 0))} asleep"
+            since_str = ""
+            start_iso = sess.get("start_time")
+            if start_iso:
+                try:
+                    from datetime import datetime as _dt
+                    st = _dt.fromisoformat(start_iso).astimezone()
+                    since_str = f"  (since {st.strftime('%H:%M')})"
+                except Exception:
+                    pass
             self._total_label.configure(
-                text=f"Total session: {_fmt(sess.get('total_session_seconds', 0))}")
+                text=f"Total session: {_fmt(sess.get('total_session_seconds', 0))}{since_str}")
             self._breakdown_label.configure(
                 text=f"\U0001f319 Deep: {_fmt(sess.get('deep_seconds', 0))}   "
                      f"\U0001f4a4 Light: {_fmt(sess.get('light_seconds', 0))}   "
@@ -331,21 +346,12 @@ class DashboardFrame(ctk.CTkFrame):
         self.alert_label.pack(padx=15, pady=10)
         self._alert_visible = False
 
-        # Tabview
-        self.tabview = ctk.CTkTabview(self, fg_color=COLORS["bg"],
-                                       segmented_button_fg_color=COLORS["border"],
-                                       segmented_button_selected_color=COLORS["blue"],
-                                       segmented_button_unselected_color=COLORS["card"])
-        self.tabview.pack(fill="both", expand=True, padx=15, pady=(5, 15))
-
-        # === TAB 1: LIVE VITALS ===
-        tab_vitals = self.tabview.add("Live Vitals")
-
-        vitals_scroll = ctk.CTkScrollableFrame(tab_vitals, fg_color=COLORS["bg"])
-        vitals_scroll.pack(fill="both", expand=True)
+        # Single scrollable view (matches web dashboard layout)
+        self.main_scroll = ctk.CTkScrollableFrame(self, fg_color=COLORS["bg"])
+        self.main_scroll.pack(fill="both", expand=True, padx=15, pady=(5, 15))
 
         # Vital cards row
-        vitals_grid = ctk.CTkFrame(vitals_scroll, fg_color="transparent")
+        vitals_grid = ctk.CTkFrame(self.main_scroll, fg_color="transparent")
         vitals_grid.pack(fill="x", pady=(5, 10))
         vitals_grid.columnconfigure((0, 1, 2, 3), weight=1, uniform="vital")
 
@@ -362,11 +368,11 @@ class DashboardFrame(ctk.CTkFrame):
         self.lag_card.grid(row=0, column=3, padx=5, pady=5, sticky="nsew")
 
         # Technical Diagnostics section
-        ctk.CTkLabel(vitals_scroll, text="TECHNICAL DIAGNOSTICS",
+        ctk.CTkLabel(self.main_scroll, text="TECHNICAL DIAGNOSTICS",
                      font=("Inter", 12, "bold"),
                      text_color=COLORS["text_sub"]).pack(anchor="w", pady=(15, 8))
 
-        tech_grid = ctk.CTkFrame(vitals_scroll, fg_color="transparent")
+        tech_grid = ctk.CTkFrame(self.main_scroll, fg_color="transparent")
         tech_grid.pack(fill="x", pady=(0, 10))
         tech_grid.columnconfigure((0, 1, 2, 3, 4, 5), weight=1, uniform="tech")
 
@@ -377,28 +383,25 @@ class DashboardFrame(ctk.CTkFrame):
             ("rsi", "WiFi Signal"), ("sc", "Sock Conn"), ("chg", "Charging"),
             ("bat", "Battery"), ("st", "Skin Temp"), ("sock_off", "Sock Off"),
         ]
-        # Sleep session panel spans columns 0-1 on the second row (index 5-6)
-        self.sleep_panel = SleepPanel(tech_grid)
-        self.sleep_panel.grid(row=0, column=4, columnspan=2,
-                              padx=4, pady=4, sticky="nsew")
+        # Row 0: first 6 tech cards, Row 1: remaining 5 tech cards
         for i, (key, label) in enumerate(tech_items):
             r = i // 6
             c = i % 6
-            # Shift second-row items: first 5 fill row 0 cols 0-4, then row 1
-            if i < 5:
-                r, c = 0, i
-            else:
-                r, c = 1, (i - 5)
             card = TechCard(tech_grid, label)
             card.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
             self.tech_cards[key] = card
 
-        # Alert history summary on live vitals tab
-        ctk.CTkLabel(vitals_scroll, text="ALERT HISTORY SUMMARY",
+        # Sleep panel on its own row, full width
+        self.sleep_panel = SleepPanel(tech_grid)
+        self.sleep_panel.grid(row=2, column=0, columnspan=6,
+                              padx=4, pady=4, sticky="nsew")
+
+        # Alert history summary
+        ctk.CTkLabel(self.main_scroll, text="ALERT HISTORY SUMMARY",
                      font=("Inter", 12, "bold"),
                      text_color=COLORS["text_sub"]).pack(anchor="w", pady=(15, 8))
 
-        summary_grid = ctk.CTkFrame(vitals_scroll, fg_color="transparent")
+        summary_grid = ctk.CTkFrame(self.main_scroll, fg_color="transparent")
         summary_grid.pack(fill="x", pady=(0, 10))
         summary_grid.columnconfigure((0, 1, 2, 3), weight=1, uniform="summary")
 
@@ -414,18 +417,12 @@ class DashboardFrame(ctk.CTkFrame):
             card.grid(row=0, column=i, padx=4, pady=4, sticky="nsew")
             self.summary_cards[key] = card
 
-        # === TAB 2: DEVICE INSIGHTS ===
-        tab_raw = self.tabview.add("Device Insights")
-
-        insights_scroll = ctk.CTkScrollableFrame(tab_raw, fg_color=COLORS["bg"])
-        insights_scroll.pack(fill="both", expand=True)
-
-        # --- Section 1: Device & Firmware Info ---
-        ctk.CTkLabel(insights_scroll, text="DEVICE & FIRMWARE",
+        # Device & Firmware Info
+        ctk.CTkLabel(self.main_scroll, text="DEVICE & FIRMWARE",
                      font=("Inter", 12, "bold"),
-                     text_color=COLORS["text_sub"]).pack(anchor="w", pady=(5, 8))
+                     text_color=COLORS["text_sub"]).pack(anchor="w", pady=(15, 8))
 
-        info_grid = ctk.CTkFrame(insights_scroll, fg_color="transparent")
+        info_grid = ctk.CTkFrame(self.main_scroll, fg_color="transparent")
         info_grid.pack(fill="x", pady=(0, 10))
         info_grid.columnconfigure((0, 1, 2, 3), weight=1, uniform="info")
 
@@ -441,12 +438,12 @@ class DashboardFrame(ctk.CTkFrame):
             card.grid(row=i // 4, column=i % 4, padx=4, pady=4, sticky="nsew")
             self.info_cards[key] = card
 
-        # --- Section 2: Monitoring Settings ---
-        ctk.CTkLabel(insights_scroll, text="MONITORING SETTINGS",
+        # Monitoring Settings
+        ctk.CTkLabel(self.main_scroll, text="MONITORING SETTINGS",
                      font=("Inter", 12, "bold"),
                      text_color=COLORS["text_sub"]).pack(anchor="w", pady=(15, 8))
 
-        settings_grid = ctk.CTkFrame(insights_scroll, fg_color="transparent")
+        settings_grid = ctk.CTkFrame(self.main_scroll, fg_color="transparent")
         settings_grid.pack(fill="x", pady=(0, 10))
         settings_grid.columnconfigure((0, 1, 2, 3), weight=1, uniform="settings")
 
@@ -460,8 +457,8 @@ class DashboardFrame(ctk.CTkFrame):
             card.grid(row=0, column=i, padx=4, pady=4, sticky="nsew")
             self.settings_cards[key] = card
 
-        # --- Section 3: Alert History ---
-        alert_header = ctk.CTkFrame(insights_scroll, fg_color="transparent")
+        # Alert History
+        alert_header = ctk.CTkFrame(self.main_scroll, fg_color="transparent")
         alert_header.pack(fill="x", pady=(15, 8))
         ctk.CTkLabel(alert_header, text="ALERT HISTORY",
                      font=("Inter", 12, "bold"),
@@ -472,7 +469,7 @@ class DashboardFrame(ctk.CTkFrame):
         self.alert_count_label.pack(side="right")
 
         # Alert history table header
-        alert_table_header = ctk.CTkFrame(insights_scroll, fg_color=COLORS["table_header"],
+        alert_table_header = ctk.CTkFrame(self.main_scroll, fg_color=COLORS["table_header"],
                                            corner_radius=8)
         alert_table_header.pack(fill="x")
         alert_table_header.columnconfigure(0, weight=1)
@@ -487,7 +484,7 @@ class DashboardFrame(ctk.CTkFrame):
                 row=0, column=col, padx=8, pady=6, sticky="w")
 
         # Scrollable alert history body
-        self.alert_scroll = ctk.CTkScrollableFrame(insights_scroll, fg_color=COLORS["card"],
+        self.alert_scroll = ctk.CTkScrollableFrame(self.main_scroll, fg_color=COLORS["card"],
                                                     height=250)
         self.alert_scroll.pack(fill="x", pady=(0, 10))
         self.alert_scroll.columnconfigure(0, weight=1)
@@ -513,9 +510,9 @@ class DashboardFrame(ctk.CTkFrame):
         self.warning_frame.configure(fg_color=color, border_color=border)
         self.warning_label.configure(text=f"⚠  {message}", text_color=text_color)
         if not self._warning_visible:
-            self.tabview.pack_forget()
+            self.main_scroll.pack_forget()
             self.warning_frame.pack(fill="x", padx=20, pady=(5, 0))
-            self.tabview.pack(fill="both", expand=True, padx=15, pady=(5, 15))
+            self.main_scroll.pack(fill="both", expand=True, padx=15, pady=(5, 15))
             self._warning_visible = True
 
     def hide_warning(self):
@@ -531,9 +528,9 @@ class DashboardFrame(ctk.CTkFrame):
         self.alert_frame.configure(fg_color=fg, border_color=border)
         self.alert_label.configure(text=f"🚨  {alert_text}", text_color=text_color)
         if not self._alert_visible:
-            self.tabview.pack_forget()
+            self.main_scroll.pack_forget()
             self.alert_frame.pack(fill="x", padx=20, pady=(5, 0))
-            self.tabview.pack(fill="both", expand=True, padx=15, pady=(5, 15))
+            self.main_scroll.pack(fill="both", expand=True, padx=15, pady=(5, 15))
             self._alert_visible = True
 
     def hide_alerts(self):
@@ -953,99 +950,18 @@ class OwletDesktopApp(ctk.CTk):
             self._loop.close()
 
     async def _worker(self, email, password, region):
-        """Async worker: authenticate, discover sock, stream vitals."""
-        init_csv_logging(LOG_FILE)
+        """Async worker: streams vitals from owlet_monitor and updates the GUI."""
+        self.after(0, self._show_dashboard)
 
-        api = OwletAPI(region, email, password)
         try:
-            await api.authenticate()
-            logger.info("Authenticated successfully")
-
-            # Switch to dashboard on the main thread
-            self.after(0, self._show_dashboard)
-
-            socks = await discover_socks(api)
-            if not socks:
-                all_devs = await api.get_devices()
-                devices_list = []
-                if isinstance(all_devs, list):
-                    devices_list = all_devs
-                elif isinstance(all_devs, dict) and "response" in all_devs:
-                    devices_list = all_devs["response"]
-                if devices_list:
-                    first_dev = devices_list[0].get("device")
-                    if first_dev:
-                        socks = [Sock(api, first_dev)]
-
-            if not socks:
-                self.after(0, lambda: self._show_error("No Owlet sock found on this account."))
-                return
-
-            sock = socks[0]
-            serial = sock.serial
-            logger.info("Sock discovered, starting monitoring...")
-
-            stale_count = 0
-            max_stale_before_warning = 3
-            max_lag_seconds = 30
-            sleep_start_checked = False
-
-            while self._worker_running:
-                result = await sock.update_properties()
-
-                # Handle token refresh
-                if isinstance(result, dict) and "tokens" in result:
-                    tokens = result["tokens"]
-                    if tokens:
-                        logger.info("API tokens refreshed automatically")
-
-                if sock.raw_properties:
-                    data = process_properties(sock.raw_properties)
-
-                    # One-time startup check: if baby is already sleeping,
-                    # query datapoint history to find when sleep started
-                    if not sleep_start_checked:
-                        sleep_start_checked = True
-                        if data['meta'].get('sleeping') and not data['meta'].get('sleep_session', {}).get('active'):
-                            try:
-                                start_ts = await find_sleep_start(api, serial)
-                                if start_ts:
-                                    set_sleep_start(start_ts)
-                                    logger.info(f"Sleep start seeded from datapoint history: {start_ts}")
-                                    data = process_properties(sock.raw_properties)
-                            except Exception as e:
-                                logger.warning(f"Sleep start lookup failed: {e}")
-
-                    lag = data["meta"]["lag_seconds"]
-
-                    if lag > max_lag_seconds:
-                        stale_count += 1
-                        data["meta"]["stale_warning"] = True
-                        data["meta"]["stale_message"] = f"Connection may be lost. Data is {lag:.0f} seconds old."
-                        if stale_count >= max_stale_before_warning:
-                            data["meta"]["stale_critical"] = True
-                            data["meta"]["stale_message"] = "Base station connection lost. Check your Owlet device."
-                    else:
-                        stale_count = 0
-
-                    # Update GUI on main thread
-                    self.after(0, self._update_dashboard, data)
-
-                    log_data_to_csv(LOG_FILE, data["vitals"], lag)
-
-                    logger.info(
-                        f"HR: {data['vitals'].get('hr')} | "
-                        f"Lag: {lag}s | "
-                        f"BP: {data['vitals'].get('bp')}"
-                    )
-
-                await asyncio.sleep(UPDATE_INTERVAL)
-
+            async for data in owlet_data_stream(
+                email, password, region,
+                stop_check=lambda: not self._worker_running,
+            ):
+                self.after(0, self._update_dashboard, data)
         except Exception as e:
             logger.error(f"Worker error: {e}")
             self.after(0, lambda: self._show_error(f"Connection failed: {e}"))
-        finally:
-            await api.close()
 
     def _show_dashboard(self):
         """Switch from login to dashboard view."""

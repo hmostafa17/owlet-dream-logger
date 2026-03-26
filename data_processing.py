@@ -25,13 +25,24 @@ _sleep_session = {
 }
 
 
-def set_sleep_start(epoch: float):
-    """Seed the sleep session from an external source (e.g. datapoint history)."""
+def set_sleep_start(start_info):
+    """Seed the sleep session from an external source (e.g. datapoint history).
+
+    start_info: dict with start_ts, light_secs, deep_secs, awake_secs, last_ts, last_ss
+                OR a plain float epoch (legacy).
+    """
+    if isinstance(start_info, (int, float)):
+        _sleep_session["active"] = True
+        _sleep_session["start_ts"] = start_info
+        _sleep_session["last_ts"] = start_info
+        return
     _sleep_session["active"] = True
-    _sleep_session["start_ts"] = epoch
-    # We don't know state breakdown from history, so leave counters at 0;
-    # they'll accumulate from this point on.
-    _sleep_session["last_ts"] = epoch
+    _sleep_session["start_ts"] = start_info["start_ts"]
+    _sleep_session["last_ts"] = start_info.get("last_ts", start_info["start_ts"])
+    _sleep_session["last_ss"] = start_info.get("last_ss")
+    _sleep_session["light_secs"] = start_info.get("light_secs", 0.0)
+    _sleep_session["deep_secs"] = start_info.get("deep_secs", 0.0)
+    _sleep_session["awake_secs"] = start_info.get("awake_secs", 0.0)
 
 
 def reset_sleep_session():
@@ -45,18 +56,20 @@ def reset_sleep_session():
     _sleep_session["awake_secs"] = 0.0
 
 
-async def find_sleep_start(api, dsn: str) -> float | None:
-    """Query Ayla datapoint history to find when the current sleep session began.
+async def find_sleep_start(api, dsn: str) -> dict | None:
+    """Query Ayla datapoint history to find when the current sleep session began
+    and reconstruct the state breakdown from historical data.
 
     Walks backwards through recent REAL_TIME_VITALS datapoints looking for
     the earliest consecutive sleeping reading (not interrupted by docking).
 
-    Returns the Unix epoch of the sleep start, or None if not found.
+    Returns dict with start_ts, light_secs, deep_secs, awake_secs, last_ts,
+    last_ss — or None if no active sleep session found.
     """
     try:
         resp = await api.request(
             "GET",
-            f"/dsns/{dsn}/properties/REAL_TIME_VITALS/datapoints.json?limit=500&order=desc",
+            f"/dsns/{dsn}/properties/REAL_TIME_VITALS/datapoints.json?limit=2000&order=desc",
         )
     except Exception:
         return None
@@ -64,10 +77,8 @@ async def find_sleep_start(api, dsn: str) -> float | None:
     if not isinstance(resp, list) or not resp:
         return None
 
-    # Walk from most recent backwards; find where the session started.
-    # The session boundary is a docking event (chg==1 or chg==2) or
-    # reaching the end of available history.
-    last_sleep_ts = None
+    # Collect session datapoints (walk back to docking boundary)
+    session_points = []
     for dp in resp:
         d = dp.get("datapoint", dp)
         val = d.get("value", "")
@@ -89,15 +100,58 @@ async def find_sleep_start(api, dsn: str) -> float | None:
         except Exception:
             continue
 
-        # If we hit a docking event, the session started after this point
+        # Docking = session boundary
         if chg in (1, 2):
             break
 
-        if ss in (8, 15):
-            last_sleep_ts = ts  # keep going further back
-        # ss=1 (awake) during session is fine — keep walking
+        session_points.append({"ts": ts, "ss": ss})
 
-    return last_sleep_ts
+    if not session_points:
+        return None
+
+    # Reverse to chronological order (oldest first)
+    session_points.reverse()
+
+    # Find earliest sleep reading
+    start_ts = None
+    for p in session_points:
+        if p["ss"] in (8, 15):
+            start_ts = p["ts"]
+            break
+
+    if start_ts is None:
+        return None
+
+    # Accumulate breakdown from start_ts forward
+    light_secs = 0.0
+    deep_secs = 0.0
+    awake_secs = 0.0
+    prev_ts = None
+    prev_ss = None
+    for p in session_points:
+        if p["ts"] < start_ts:
+            continue
+        if prev_ts is not None:
+            delta = p["ts"] - prev_ts
+            if 0 < delta < 1800:  # 30 min gap tolerance
+                if prev_ss == 8:
+                    light_secs += delta
+                elif prev_ss == 15:
+                    deep_secs += delta
+                elif prev_ss == 1:
+                    awake_secs += delta
+        prev_ts = p["ts"]
+        prev_ss = p["ss"]
+
+    last_point = session_points[-1]
+    return {
+        "start_ts": start_ts,
+        "light_secs": light_secs,
+        "deep_secs": deep_secs,
+        "awake_secs": awake_secs,
+        "last_ts": last_point["ts"],
+        "last_ss": last_point["ss"],
+    }
 
 
 def robust_json_parse(value):
@@ -401,7 +455,7 @@ def process_properties(raw_props, alerts=None):
     # Accumulate time in current state
     if _sleep_session["active"] and last_update_ts and _sleep_session["last_ts"]:
         delta = last_update_ts - _sleep_session["last_ts"]
-        if 0 < delta < 300:  # ignore gaps > 5 min (connection loss)
+        if 0 < delta < 1800:  # 30 min gap tolerance (baby stays asleep during connection drops)
             prev_ss = _sleep_session["last_ss"]
             if prev_ss == 8:
                 _sleep_session["light_secs"] += delta
@@ -417,7 +471,13 @@ def process_properties(raw_props, alerts=None):
     # Build sleep meta
     session_active = _sleep_session["active"]
     total_sleep = _sleep_session["light_secs"] + _sleep_session["deep_secs"]
-    total_session = total_sleep + _sleep_session["awake_secs"]
+    total_accumulated = total_sleep + _sleep_session["awake_secs"]
+
+    # Total session = wall-clock time from start (matches mobile app behavior)
+    if session_active and _sleep_session["start_ts"] and last_update_ts:
+        total_session = max(last_update_ts - _sleep_session["start_ts"], total_accumulated)
+    else:
+        total_session = total_accumulated
 
     return {
         "vitals": vitals,
@@ -438,6 +498,7 @@ def process_properties(raw_props, alerts=None):
                 "light_seconds": round(_sleep_session["light_secs"]),
                 "deep_seconds": round(_sleep_session["deep_secs"]),
                 "awake_seconds": round(_sleep_session["awake_secs"]),
+                "start_time": datetime.fromtimestamp(_sleep_session["start_ts"], tz=timezone.utc).isoformat() if _sleep_session["start_ts"] else None,
             },
         },
     }
